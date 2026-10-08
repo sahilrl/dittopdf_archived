@@ -258,3 +258,27 @@ def make_second(path: Path, *, pages: int = 2, encryption: pikepdf.Encryption | 
     pdf.Root.PageLayout = Name.SinglePage
     pdf.save(path, encryption=encryption or False)
     return path
+
+
+def make_with_header(path: Path, header: bytes, eol: bytes = b"\n") -> Path:
+    """A minimal hand-written PDF that starts with exactly ``header``."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>",
+        b"<< /Title (Header test) /Producer (Acrobat Distiller 23.0) >>",
+    ]
+    out = bytearray(header)
+    offsets = []
+    for n, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj" % n + eol + body + eol + b"endobj" + eol
+    xref = len(out)
+    out += b"xref" + eol + b"0 %d" % (len(objects) + 1) + eol + b"0000000000 65535 f\r\n"
+    for off in offsets:
+        out += b"%010d 00000 n\r\n" % off
+    out += (b"trailer" + eol + b"<< /Size %d /Root 1 0 R /Info 4 0 R /ID [<%s><%s>] >>" %
+            (len(objects) + 1, b"11" * 16, b"22" * 16) + eol)
+    out += b"startxref" + eol + b"%d" % xref + eol + b"%%EOF" + eol
+    path.write_bytes(bytes(out))
+    return path

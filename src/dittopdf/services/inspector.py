@@ -485,7 +485,12 @@ def _structure(ctx: Ctx) -> None:
     if raw["header_offset"]:
         ctx.info("structure:header_offset", P, "Bytes before %PDF header", raw["header_offset"],
                  cls=REGENERATE, warn="Junk before the header.")
-    ctx.info("structure:binary_marker", P, "Binary marker comment", raw["binary_marker"], cls=REGENERATE)
+    block = bytes.fromhex(raw["header_block"]) if raw.get("header_block") else b""
+    e = ctx.info("structure:binary_marker", P, "Header bytes (header line + binary marker)",
+                 f"{_escape(block)}\nhex: {block.hex(' ')}" if block else None, cls=RECONSTRUCT,
+                 note="Reproduced byte for byte by the 'Header bytes' output option (offsets are corrected).")
+    if block:
+        e["canon"] = "v:" + block.hex()
 
     P = ["Structure", "Pages"]
     ctx.info("structure:page_count", P, "Page count", len(pdf.pages), cls=READONLY,
@@ -586,6 +591,21 @@ def _structure(ctx: Ctx) -> None:
     if raw["chain_error"]:
         ctx.info("structure:chain_error", P, "Chain problem", raw["chain_error"], cls=READONLY,
                  warn="The cross-reference chain is damaged; qpdf reconstructed it.")
+
+
+def _escape(data: bytes) -> str:
+    """Bytes as text with line endings and non-ASCII bytes shown escaped."""
+    out = []
+    for b in data:
+        if b == 0x0D:
+            out.append("\\r")
+        elif b == 0x0A:
+            out.append("\\n")
+        elif 32 <= b < 127:
+            out.append(chr(b))
+        else:
+            out.append(f"\\x{b:02x}")
+    return "".join(out)
 
 
 def _size_text(w: Any, h: Any, rot: int) -> str:

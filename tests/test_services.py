@@ -350,3 +350,56 @@ def test_reproduces_each_encryption_revision(tmp_path, R):
     rep, _, _ = run(orig, second, tmp_path / "out.pdf")
     with Pdf.open(tmp_path / "out.pdf") as o:
         assert o.is_encrypted and o.encryption.R == R
+
+
+ACROBAT = b"%PDF-1.6\r\n%\xe2\xe3\xcf\xd3\r\n"   # 17 bytes: longer than qpdf's 15
+BARE = b"%PDF-1.4\n"                             # no marker: shorter
+SAME = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"          # same length as qpdf's
+
+
+@pytest.mark.parametrize("header", [ACROBAT, BARE, SAME], ids=["longer", "shorter", "same-length"])
+@pytest.mark.parametrize("mode", ["table", "objstm", "encrypted", "linearized"])
+def test_header_bytes_reproduced(tmp_path, second, header, mode):
+    from factory import make_with_header
+    from dittopdf.services.rawfile import header_block
+
+    eol = b"\r\n" if header.endswith(b"\r\n") else b"\n"
+    orig = make_with_header(tmp_path / "h.pdf", header, eol)
+    assert header_block(orig.read_bytes(), 0)[0] == header
+    out = tmp_path / "out.pdf"
+    opts = {"table": {}, "objstm": {"object_streams": "generate"},
+            "encrypted": {"encryption": "original", "enc_user": "pw", "enc_R": 6},
+            "linearized": {"linearize": True}}[mode]
+    rep, outcomes, _ = run(orig, second, out, **opts)
+    item = outcomes["structure:binary_marker"]
+    data = out.read_bytes()
+    if mode == "linearized" and len(header) != 15:
+        assert item["outcome"] == "failed" and "linearization" in item["message"]
+        return
+    assert item["outcome"] == "copied", item["message"]
+    if mode == "encrypted":  # AES-256 requires PDF 1.7: same marker bytes and line endings, version raised
+        from dittopdf.services.headerfix import desired_block
+        header = desired_block(header, "1.7")
+    assert data.startswith(header)
+    password = "pw" if mode == "encrypted" else ""
+    with Pdf.open(out, password=password) as o, Pdf.open(second) as sec:
+        assert not o.get_warnings()
+        assert len(o.pages) == 2
+        assert o.pages[0].obj.Contents.read_bytes() == sec.pages[0].obj.Contents.read_bytes()
+        assert o.docinfo.Title == "Header test"
+        assert o.is_encrypted == (mode == "encrypted") and o.is_linearized == (mode == "linearized")
+        assert not o.check_pdf_syntax()
+        if mode == "linearized":
+            o.check_linearization()
+        if mode != "encrypted":
+            assert [bytes(x) for x in o.trailer.ID] == [b"\x11" * 16, b"\x22" * 16]
+    e = entries(out, password)
+    assert e["structure:binary_marker"]["canon"] == "v:" + header.hex()
+
+
+def test_header_writer_default(tmp_path, second):
+    from factory import make_with_header
+
+    orig = make_with_header(tmp_path / "h.pdf", ACROBAT, b"\r\n")
+    run(orig, second, tmp_path / "out.pdf", header_mode="writer")
+    assert (tmp_path / "out.pdf").read_bytes().startswith(b"%PDF-1.6\n%\xbf\xf7\xa2\xfe\n")

@@ -96,8 +96,16 @@ What this means in practice:
   bookmark to page 3 of a 2-page output) become null, and the report says so.
 - **The XMP packet** is copied byte for byte when unchanged. Edits are applied
   with lxml, so unrelated properties and custom schemas are preserved. pikepdf's
-  automatic XMP rewrite during save is disabled, and the written packet is
-  verified.
+  automatic XMP rewrite during save is disabled (`fix_metadata_version=False`),
+  and the written packet is verified.
+- **Header bytes.** The original's header line and binary-marker comment
+  (e.g. `%PDF-1.7\r\n%âãÏÓ\r\n`) are reproduced byte for byte, line endings
+  included. qpdf always writes its own header, so the block is replaced after
+  saving. If the length differs, all object offsets are shifted and the
+  cross-reference table or stream is corrected. The result is reopened and
+  every object is compared before it's kept. Linearized output can only be
+  rewritten when the lengths are equal; otherwise this is reported as not
+  reproduced. Bytes before `%PDF-` are not reproduced.
 - **`/ID`.** qpdf keeps the first element and regenerates the second. By default,
   dittopdf then reproduces the second element exactly using a same-length
   substitution, and verifies the result. This isn't possible for encrypted
@@ -115,7 +123,7 @@ What this means in practice:
 | Structure tree | keep the second PDF's (default) · copy the original's (only correct if the content is the same) |
 | File identifier | reproduce both elements (default) · keep the first, regenerate the second |
 | Metadata consistency | write Info overrides into the matching XMP properties (default on) |
-| File structure | header version (defaults to the original's), linearization and object streams (both default to match the original), compress uncompressed streams |
+| File structure | header version (defaults to the original's), header bytes (match the original · writer default), linearization and object streams (both default to match the original), compress uncompressed streams |
 | Encryption | none · the original's method and permissions · keep the second PDF's |
 
 ### Security
@@ -152,6 +160,7 @@ src/dittopdf/
 │   ├── xmp.py         # XMP parsing / editing (lxml)
 │   ├── pdfobj.py      # pikepdf ↔ typed JSON, display, canonical digests
 │   ├── rawfile.py     # byte-level structure: header, revisions, /Prev chain
+│   ├── headerfix.py   # reproduce header bytes after saving (offset correction)
 │   ├── resources.py   # font/image discovery, image placement & DPI
 │   ├── fonts.py       # embedded font programs (fontTools)
 │   ├── signatures.py  # signature fields and certificates (cryptography)

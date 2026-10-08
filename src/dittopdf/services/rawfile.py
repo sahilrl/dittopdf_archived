@@ -33,17 +33,44 @@ def analyse(data: bytes) -> dict[str, Any]:
         "xref_streams": len(re.findall(rb"/Type\s*/XRef\b", data)),
         "trailing_bytes": 0,
     }
+    out["header_block"] = out["header_eol"] = out["marker"] = None
     if m:
-        line_end = data.find(b"\n", m.end())
-        nxt = data[line_end + 1: line_end + 40] if line_end != -1 else b""
-        if nxt.startswith(b"%") and any(b > 127 for b in nxt[1:6]):
-            out["binary_marker"] = nxt[1:5].hex()
+        block, eol, marker = header_block(data, m.start())
+        out["header_block"], out["header_eol"], out["marker"] = block.hex(), eol.hex(), marker.hex()
+        if marker:
+            out["binary_marker"] = marker.hex()
     last_eof = data.rfind(b"%%EOF")
     if last_eof != -1:
         out["trailing_bytes"] = len(data[last_eof + 5:].strip())
     if out["startxref"]:
         _walk_chain(data, out["startxref"][-1], out)
     return out
+
+
+def _line(data: bytes, pos: int) -> tuple[int, bytes]:
+    """End of the line starting at ``pos`` (after its EOL) and the EOL bytes."""
+    i = pos
+    while i < len(data) and data[i] not in (0x0A, 0x0D):
+        i += 1
+    if data[i:i + 2] == b"\r\n":
+        return i + 2, b"\r\n"
+    if i < len(data):
+        return i + 1, data[i:i + 1]
+    return i, b""
+
+
+def header_block(data: bytes, start: int) -> tuple[bytes, bytes, bytes]:
+    """The header line plus the comment lines directly after it (the binary marker).
+
+    Returns (block, EOL of the header line, comment lines). All bytes are exact,
+    including line endings, so the block can be reproduced byte for byte.
+    """
+    end, eol = _line(data, start)
+    pos = end
+    while pos < len(data) and pos - start < 1024 and data[pos:pos + 1] == b"%" \
+            and not data.startswith(b"%%EOF", pos):
+        pos, _ = _line(data, pos)
+    return data[start:pos], eol, data[end:pos]
 
 
 def _walk_chain(data: bytes, offset: int, out: dict) -> None:
