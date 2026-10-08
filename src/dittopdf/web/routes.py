@@ -374,12 +374,16 @@ def parse_options(form: Any, defaults: Options) -> tuple[Options, list[str]]:
     o.struct_tree = choice("opt_struct_tree", {"keep", "copy"}, o.struct_tree)
     o.id_mode = choice("opt_id_mode", {"exact", "first"}, o.id_mode)
     o.header_mode = choice("opt_header_mode", {"match", "writer"}, o.header_mode)
+    o.numbering = choice("opt_numbering", {"preserve", "writer"}, o.numbering)
     o.object_streams = choice("opt_object_streams", {"match", "generate", "disable", "preserve"},
                               o.object_streams)
     o.encryption = choice("opt_encryption", {"none", "original", "second"}, o.encryption)
     o.propagate_xmp = form.get("opt_propagate_xmp") == "on"
     o.linearize = form.get("opt_linearize") == "on"
     o.compress = form.get("opt_compress") == "on"
+    if o.linearize and o.numbering == "preserve":
+        errors.append("Linearization needs qpdf's writer, which renumbers objects: choose 'let the writer "
+                      "renumber' under Object numbers, or turn linearization off.")
     version = form.get("opt_version", o.version).strip()
     if version and not re.fullmatch(r"1\.[0-7]|2\.0", version):
         errors.append(f"PDF version {version!r} is not one of 1.0–1.7 or 2.0.")

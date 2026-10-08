@@ -18,7 +18,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from dittopdf.services import fonts as fontmod
-from dittopdf.services import pdfobj, rawfile, resources, signatures, xmp
+from dittopdf.services import numbering, pdfobj, rawfile, resources, signatures, xmp
 from dittopdf.services.model import (
     COPY, DIRECT, KEEP, READONLY, RECONSTRUCT, REGENERATE, REMOVE, UNREPRODUCIBLE,
     entry, info_entry, obj_entry,
@@ -579,6 +579,34 @@ def _structure(ctx: Ctx) -> None:
              "\n".join(warnings[:20]) + (f"\n… {len(warnings) - 20} more" if len(warnings) > 20 else "")
              if warnings else None, cls=READONLY)
 
+    P = ["Structure", "Object numbering"]
+    note = "Kept by the 'Object numbers' output option (dittopdf writes the file itself)."
+
+    def objnum(id: str, label: str, o: Any) -> None:
+        ok = is_obj(o, pikepdf.Object) and o.is_indirect
+        ctx.info(id, P, label, f"{o.objgen[0]} {o.objgen[1]}" if ok else None, cls=RECONSTRUCT, note=note)
+
+    objnum("structure:objnum:root", "Catalog object number", pdf.Root)
+    objnum("structure:objnum:info", "Info dictionary object number", pdf.trailer.get("/Info"))
+    objnum("structure:objnum:pages", "Page tree root object number", pdf.Root.get("/Pages"))
+    objnum("structure:objnum:metadata", "XMP stream object number", pdf.Root.get("/Metadata"))
+    ctx.info("structure:objnum:size", P, "Trailer /Size", int(pdf.trailer.get("/Size", 0) or 0) or None,
+             cls=RECONSTRUCT, note="One more than the highest object number.")
+    membership = numbering.objstm_membership(pdf)
+    if membership:
+        groups: dict[int, list[int]] = {}
+        for n, k in sorted(membership.items()):
+            groups.setdefault(k, []).append(n)
+        e = ctx.info("structure:objnum:objstm", P, "Objects inside object streams",
+                     "\n".join(f"stream {k}: objects {_ranges(set(ns))}" for k, ns in sorted(groups.items())),
+                     cls=RECONSTRUCT, note=note)
+        e["canon"] = "v:" + ";".join(f"{n}>{k}" for n, k in sorted(membership.items()))
+    else:
+        ctx.info("structure:objnum:objstm", P, "Objects inside object streams", None, cls=RECONSTRUCT, note=note)
+    xs = numbering.xref_streams(pdf)
+    ctx.info("structure:objnum:xref", P, "Cross-reference data",
+             f"stream, object {xs[-1]}" if xs else "classic table", cls=RECONSTRUCT, note=note)
+
     P = ["Structure", "Revisions"]
     secs = raw["sections"]
     revisions = raw["eof_markers"] - (1 if pdf.is_linearized and raw["eof_markers"] > 1 else 0)
@@ -644,6 +672,8 @@ def _pages(ctx: Ctx) -> None:
                                                                  int(po.get("/Rotate", 0) or 0)), cls=READONLY)
         except Exception as e:
             ctx.info(f"page:{i}:size", P, "Page size", None, error=str(e))
+        ctx.info(f"page:{i}:objnum", P, "Object number", f"{po.objgen[0]} {po.objgen[1]}", cls=RECONSTRUCT,
+                 note="Kept by the 'Object numbers' output option.")
         for k, spec in PAGE.items():
             v, inherited = _effective(po, k)
             if k == "/Parent":

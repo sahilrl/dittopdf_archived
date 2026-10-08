@@ -320,11 +320,18 @@ def test_structure_options_follow_original(tmp_path, second):
         pdf.add_blank_page()
         pdf.save(src, linearize=True, object_stream_mode=pikepdf.ObjectStreamMode.generate, force_version="1.6")
     out = tmp_path / "out.pdf"
+    # Default: object numbers win over linearization.
     rep, outcomes, _ = run(src, second, out)
+    with Pdf.open(out) as o:
+        assert not o.is_linearized and o.pdf_version == "1.6"
+    assert outcomes["structure:linearized"]["partial"]
+    assert entries(out)["structure:object_streams"]["display"].startswith("Yes")
+    # Linearization through qpdf's writer (which renumbers).
+    rep, outcomes, _ = run(src, second, out, numbering="writer", linearize=True)
     with Pdf.open(out) as o:
         assert o.is_linearized and o.pdf_version == "1.6"
     assert outcomes["structure:linearized"]["outcome"] == "reconstructed"
-    assert entries(out)["structure:object_streams"]["display"].startswith("Yes")
+    assert outcomes["structure:objnum:root"]["outcome"] == "regenerated"
 
 
 def test_report_verification(orig, second, tmp_path):
@@ -403,3 +410,90 @@ def test_header_writer_default(tmp_path, second):
     orig = make_with_header(tmp_path / "h.pdf", ACROBAT, b"\r\n")
     run(orig, second, tmp_path / "out.pdf", header_mode="writer")
     assert (tmp_path / "out.pdf").read_bytes().startswith(b"%PDF-1.6\n%\xbf\xf7\xa2\xfe\n")
+
+
+# ----------------------------------------------------------------------------- object numbers
+
+
+def _numbers(path: Path, password: str = "") -> dict:
+    with Pdf.open(path, password=password) as p:
+        out = {"root": p.Root.objgen, "pages": [pg.obj.objgen for pg in p.pages],
+               "info": p.trailer.Info.objgen if "/Info" in p.trailer else None,
+               "size": int(p.trailer.Size), "id": [bytes(x) for x in p.trailer.ID] if "/ID" in p.trailer else None}
+        for key in ("/Metadata", "/Outlines", "/Pages"):
+            out[key] = p.Root[key].objgen if key in p.Root else None
+        names = p.Root.get("/Names")
+        out["ef"] = names.EmbeddedFiles.objgen if names is not None and "/EmbeddedFiles" in names \
+            and names.EmbeddedFiles.is_indirect else None
+        return out
+
+
+def test_object_numbers_kept(orig, second, tmp_path):
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out)
+    o, x = _numbers(orig), _numbers(out)
+    for key in ("root", "info", "/Metadata", "/Outlines", "/Pages", "ef", "size", "id"):
+        assert x[key] == o[key], key
+    assert x["pages"] == o["pages"][:2]
+    assert outcomes["structure:objnum:root"]["outcome"] == "copied"
+    assert outcomes["page:3:objnum"]["outcome"] == "failed"
+    assert any("kept the original's number" in n for n in rep["notes"])
+    with Pdf.open(out) as p:
+        assert not p.get_warnings() and not p.check_pdf_syntax()
+
+
+def test_object_numbers_with_object_streams(tmp_path, second):
+    from dittopdf.services.numbering import objstm_membership, xref_streams
+
+    src = tmp_path / "objstm.pdf"
+    make_original(tmp_path / "rich.pdf", incremental=False)
+    with Pdf.open(tmp_path / "rich.pdf") as pdf:
+        pdf.save(src, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(src, second, out)
+    with Pdf.open(src) as a, Pdf.open(out) as b:
+        ma, mb = objstm_membership(a), objstm_membership(b)
+        # Counterparts (same object, same number) sit in the same object stream as in the original.
+        for x, y in [(a.Root, b.Root), (a.trailer.Info, b.trailer.Info), (a.Root.Pages, b.Root.Pages),
+                     (a.Root.Outlines, b.Root.Outlines), (a.pages[0].obj, b.pages[0].obj)]:
+            assert x.objgen == y.objgen
+            assert ma.get(x.objgen[0]) == mb.get(y.objgen[0])
+        assert xref_streams(b)[-1] == xref_streams(a)[-1]
+        assert b.Root.objgen == a.Root.objgen and not b.get_warnings()
+    assert outcomes["structure:objnum:xref"]["outcome"] == "copied"
+
+
+@pytest.mark.parametrize("R,aes", [(2, False), (3, False), (4, False), (4, True), (6, True)])
+def test_object_numbers_with_encryption(orig, second, tmp_path, R, aes):
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out, encryption="original", enc_user="pw", enc_owner="own", enc_R=R,
+                           enc_aes=aes, enc_metadata=aes)
+    o, x = _numbers(orig), _numbers(out, "pw")
+    assert (x["root"], x["info"], x["/Metadata"], x["/Outlines"]) == (o["root"], o["info"], o["/Metadata"],
+                                                                      o["/Outlines"])
+    assert x["id"] == o["id"]  # exact /ID even when encrypted
+    with Pdf.open(out, password="pw") as p, Pdf.open(orig) as src:
+        assert p.encryption.R == R and p.docinfo.Title == "Original Title"
+        assert p.Root.Metadata.read_bytes() == src.Root.Metadata.read_bytes()
+        assert not p.get_warnings()
+    with pytest.raises(pikepdf.PasswordError):
+        Pdf.open(out)
+
+
+def test_writer_numbering_option(orig, second, tmp_path):
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out, numbering="writer")
+    assert _numbers(out)["/Outlines"] != _numbers(orig)["/Outlines"]
+    assert outcomes["structure:objnum:root"]["outcome"] in ("regenerated", "copied")
+
+
+def test_numbering_falls_back_when_verification_fails(orig, second, tmp_path, monkeypatch):
+    from dittopdf.services import pdfwriter
+
+    monkeypatch.setattr(pdfwriter, "verify", lambda *a, **k: "simulated mismatch")
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out)
+    assert any("simulated mismatch" in n for n in rep["notes"])
+    assert outcomes["structure:objnum:pages"]["outcome"] == "regenerated"
+    with Pdf.open(out) as p:
+        assert p.docinfo.Title == "Original Title" and not p.get_warnings()

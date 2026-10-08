@@ -149,3 +149,16 @@ def test_sweep_removes_expired(tmp_path):
     os.utime(ws.dir, (old, old))
     assert sweep(tmp_path, ttl=3600, every=0) == 1
     assert not ws.dir.exists()
+
+
+def test_linearize_requires_writer_numbering(client, pdfs):
+    orig, second = pdfs
+    upload(client, "/upload/original", orig)
+    upload(client, "/upload/second", second)
+    assert 'name="opt_numbering"' in client.get("/edit").text
+    r = client.post("/edit", data={"csrf": token(client), "opt_linearize": "on", "opt_numbering": "preserve"})
+    assert r.status_code == 400 and "renumbers objects" in r.text
+    r = client.post("/edit", data={"csrf": token(client), "opt_linearize": "on", "opt_numbering": "writer"})
+    assert r.status_code == 302
+    with pikepdf.open(io.BytesIO(client.get("/download").data)) as pdf:
+        assert pdf.is_linearized

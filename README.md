@@ -83,7 +83,7 @@ Every property is classified, and the classification is shown in the UI:
 | **Directly copyable** | Info values, viewer preferences, page layout/mode, language, page boxes, rotation, comment author/text/dates | value copied as-is (unchanged values keep their exact bytes) |
 | **Copyable with reconstruction** | XMP properties, outlines, named destinations, page labels, open action, embedded files, output intents, PieceInfo, document parts, `/ID` | deep-copied into the output, with **page references remapped to the same page number** and shared/cyclic objects kept consistent |
 | **Read-only / diagnostic** | fonts, images, signatures, filesystem data | shown, never modified |
-| **Must be regenerated** | `/Size`, `/Prev`, xref offsets, object count, file hash | produced by the PDF writer |
+| **Must be regenerated** | `/Prev`, xref offsets, object count, file hash | produced by the PDF writer |
 | **Cannot reliably be reproduced** | structure tree, optional content, thumbnails, `/Perms`, `/DSS`, single-element `/ID` | kept from the second PDF unless you opt in |
 
 What this means in practice:
@@ -98,6 +98,25 @@ What this means in practice:
   with lxml, so unrelated properties and custom schemas are preserved. pikepdf's
   automatic XMP rewrite during save is disabled (`fix_metadata_version=False`),
   and the written packet is verified.
+- **Object numbers.** qpdf renumbers every object when it writes a file, so by
+  default dittopdf writes the output itself (`pdfwriter.py`) so object numbers
+  match the original's:
+  - Objects that *are* the original's keep their number and generation: the
+    catalog, Info, page tree, pages by number, the XMP stream, and every object
+    copied from the original.
+  - The second PDF's objects take the number of the original object in the same
+    place (e.g. page 1's `/Contents`, font `/F1`), then numbers the original
+    used for objects that aren't in the output, then numbers above its highest.
+  - Object streams follow the original's layout (same members in the same
+    stream numbers), and the cross-reference table or stream (with its number)
+    and `/Size` match where possible.
+  - Encrypted output is supported (RC4 and AES; qpdf derives the key and
+    dittopdf encrypts each object under its own number), and `/ID` is then
+    exact too.
+  - Every file is reopened and compared object by object before it's kept; if
+    anything differs, qpdf writes the file instead and the report explains why.
+  - Linearization needs qpdf's writer, so it's off by default when numbers are
+    kept. Choose *let the writer renumber* to linearize.
 - **Header bytes.** The original's header line and binary-marker comment
   (e.g. `%PDF-1.7\r\n%âãÏÓ\r\n`) are reproduced byte for byte, line endings
   included. qpdf always writes its own header, so the block is replaced after
@@ -123,7 +142,7 @@ What this means in practice:
 | Structure tree | keep the second PDF's (default) · copy the original's (only correct if the content is the same) |
 | File identifier | reproduce both elements (default) · keep the first, regenerate the second |
 | Metadata consistency | write Info overrides into the matching XMP properties (default on) |
-| File structure | header version (defaults to the original's), header bytes (match the original · writer default), linearization and object streams (both default to match the original), compress uncompressed streams |
+| File structure | object numbers (keep the original's · let the writer renumber), header version (defaults to the original's), header bytes (match the original · writer default), linearization (needs the writer to renumber), object streams (defaults to match the original), compress uncompressed streams |
 | Encryption | none · the original's method and permissions · keep the second PDF's |
 
 ### Security
@@ -160,7 +179,9 @@ src/dittopdf/
 │   ├── xmp.py         # XMP parsing / editing (lxml)
 │   ├── pdfobj.py      # pikepdf ↔ typed JSON, display, canonical digests
 │   ├── rawfile.py     # byte-level structure: header, revisions, /Prev chain
-│   ├── headerfix.py   # reproduce header bytes after saving (offset correction)
+│   ├── headerfix.py   # reproduce header bytes after a qpdf save (offset correction)
+│   ├── numbering.py   # output object numbers matching the original's
+│   ├── pdfwriter.py   # writer keeping those numbers (object streams, xref, encryption)
 │   ├── resources.py   # font/image discovery, image placement & DPI
 │   ├── fonts.py       # embedded font programs (fontTools)
 │   ├── signatures.py  # signature fields and certificates (cryptography)

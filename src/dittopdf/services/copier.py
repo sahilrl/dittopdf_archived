@@ -21,7 +21,7 @@ from typing import Any
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
-from dittopdf.services import headerfix, pdfobj, rawfile, resources, xmp
+from dittopdf.services import headerfix, numbering, pdfobj, pdfwriter, rawfile, resources, xmp
 from dittopdf.services.model import (
     COPY, CUSTOM, DIRECT, KEEP, READONLY, RECONSTRUCT, REGENERATE, REMOVE, UNREPRODUCIBLE,
 )
@@ -57,6 +57,7 @@ class Options:
     struct_tree: str = "keep"          # keep | copy
     id_mode: str = "exact"             # exact | first
     header_mode: str = "match"         # match | writer (header line + binary marker bytes)
+    numbering: str = "preserve"        # preserve (original's object numbers) | writer (qpdf renumbers)
     propagate_xmp: bool = True
     version: str = ""                  # header version to write ("" = automatic)
     linearize: bool = False
@@ -86,7 +87,9 @@ def default_options(orig: dict, second: dict, orig_password: str = "") -> Option
     """Defaults that reproduce the original as closely as possible."""
     s = orig["summary"]
     by_id = {e["id"]: e for e in orig["entries"]}
-    o = Options(version=s.get("header_version") or s["version"], linearize=bool(s["linearized"]))
+    # Keeping the original's object numbers takes precedence over linearization (only qpdf's
+    # writer can linearize, and it renumbers every object).
+    o = Options(version=s.get("header_version") or s["version"], linearize=False)
     if s["encrypted"]:
         o.encryption = "original"
         o.enc_user = orig_password
@@ -760,6 +763,139 @@ def _reproduce_header(original: Path, output: Path, password: str) -> tuple[str 
     return status, message
 
 
+def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, output: Path, opts: Options,
+                              enc: Any, version: str, second_password: str, notes: list[str]) -> dict | None:
+    """Write ``output`` with the original's object numbers; None (with a note) if that fails."""
+    tr = job.tr
+    pairs: list[tuple[Any, Any]] = [(src.Root, dst.Root), (src.trailer.get("/Info"), dst.trailer.get("/Info")),
+                                    (src.Root.get("/Pages"), dst.Root.get("/Pages")),
+                                    (src.Root.get("/Metadata"), dst.Root.get("/Metadata"))]
+    pairs += [(src.pages[i].obj, dst.pages[i].obj) for i in range(min(len(src.pages), len(dst.pages)))]
+    pairs += [(src.get_object(og), d) for og, d in tr.memo.items()]
+    pairs += [(src.get_object(og), d) for og, d in tr.remap.items() if is_obj(d, pikepdf.Object)]
+    membership = numbering.objstm_membership(src)
+    xref_nums = numbering.xref_streams(src)
+    src_enc = src.trailer.get("/Encrypt")
+    reserve = set(membership.values()) | set(xref_nums)
+    if is_obj(src_enc, pikepdf.Object) and src_enc.is_indirect:
+        reserve.add(src_enc.objgen[0])
+
+    password = _output_password(opts, second_password)
+    setup = None
+    write_version = version or dst.pdf_version
+    try:
+        if enc is not False:
+            setup = pdfwriter.prepare_encryption(dst, enc, password)
+            if setup.encryptor.R >= 5 and write_version < "1.7":
+                notes.append(f"PDF version raised from {write_version} to 1.7: AES-256 encryption requires it.")
+                write_version = "1.7"
+        nb = numbering.build_map(src, dst, pairs, reserve=reserve)
+    except Exception as e:  # pragma: no cover - defensive
+        notes.append(f"Object numbers could not be kept ({e}); qpdf renumbered them.")
+        return None
+
+    # Object streams: same membership as the original; objects new to the output join an extra stream.
+    mode = opts.object_streams
+    replicate = mode != "disable" and bool(membership)
+    layout = pdfwriter.Layout(xref_stream=bool(xref_nums), xref_num=xref_nums[-1] if xref_nums else None,
+                              size_min=nb.src_size, compress=bool(opts.compress),
+                              encrypt_num=src_enc.objgen[0] if is_obj(src_enc, pikepdf.Object)
+                              and src_enc.is_indirect else None)
+    taken = {n for n, _ in nb.map.values()} | reserve
+    extra_k = max(taken | {nb.src_max}) + 1
+    for og, (n, g) in nb.map.items():
+        if replicate and nb.kind[og] in ("counterpart", "structural") and n in membership:
+            layout.objstm_of[n] = membership[n]
+        elif (replicate or mode == "generate") and g == 0:
+            layout.objstm_of[n] = extra_k
+    if layout.encrypt_num in taken - reserve:
+        layout.encrypt_num = None
+
+    ident = [bytes(x) for x in dst.trailer.ID] if is_obj(dst.trailer.get("/ID"), Array) else None
+    if setup is not None and (ident is None or len(ident) != 2 or ident[0] != setup.id[0]):
+        ident = setup.id  # the encryption key was derived from this /ID
+    with open(original, "rb") as f:
+        head = f.read(4096)
+    start = head.find(b"%PDF-")
+    orig_header = rawfile.header_block(head, start)[0] if start != -1 else b"%PDF-1.7\n"
+    header = (headerfix.desired_block(orig_header, write_version) if opts.header_mode == "match"
+              else b"%PDF-" + write_version.encode() + b"\n%\xbf\xf7\xa2\xfe\n")
+
+    tmp = output.with_suffix(".numbered.tmp")
+    try:
+        written = pdfwriter.write(dst, nb, tmp, header, layout, ident=ident, encryption=setup)
+        problem = pdfwriter.verify(dst, nb, tmp, password, written)
+    except Exception as e:
+        problem = f"{type(e).__name__}: {e}"
+    if problem:
+        tmp.unlink(missing_ok=True)
+        notes.append(f"Object numbers could not be kept: the file written with them did not verify "
+                     f"({problem}). qpdf wrote the output and renumbered the objects.")
+        return None
+    tmp.replace(output)
+
+    stats = nb.stats()
+    notes.append(f"Object numbers: {stats['counterpart']} object(s) kept the original's number, "
+                 f"{stats['structural']} took the number of the original object in the same place, "
+                 f"{stats['reused']} reused numbers of original objects not in the output, and {stats['new']} "
+                 f"got new numbers above the original's highest ({nb.src_max}).")
+    reports: list[tuple[str, str, str, bool]] = []
+
+    def same_number(row_id: str, s_obj: Any, d_obj: Any, label: str) -> None:
+        if not (is_obj(s_obj, pikepdf.Object) and s_obj.is_indirect):
+            return
+        got = nb.map.get(d_obj.objgen) if is_obj(d_obj, pikepdf.Object) and d_obj.is_indirect else None
+        if got == s_obj.objgen:
+            reports.append((row_id, "copied", f"{label} is object {got[0]} {got[1]}, as in the original.", False))
+        else:
+            reports.append((row_id, "failed", f"{label} could not keep number {s_obj.objgen[0]} "
+                            f"{s_obj.objgen[1]}" + (" (not present in the output)." if got is None else
+                                                    f"; it is {got[0]} {got[1]}."), False))
+
+    same_number("structure:objnum:root", src.Root, dst.Root, "The catalog")
+    same_number("structure:objnum:info", src.trailer.get("/Info"), dst.trailer.get("/Info"), "The Info dictionary")
+    same_number("structure:objnum:pages", src.Root.get("/Pages"), dst.Root.get("/Pages"), "The page tree root")
+    same_number("structure:objnum:metadata", src.Root.get("/Metadata"), dst.Root.get("/Metadata"), "The XMP stream")
+    for i in range(min(len(src.pages), len(dst.pages))):
+        same_number(f"page:{i + 1}:objnum", src.pages[i].obj, dst.pages[i].obj, f"Page {i + 1}")
+    for i in range(len(dst.pages), len(src.pages)):
+        reports.append((f"page:{i + 1}:objnum", "failed", f"The second PDF has no page {i + 1}.", False))
+    trailer_size = int(src.trailer.get("/Size", 0) or 0)
+    if written.size == trailer_size:
+        reports.append(("structure:objnum:size", "copied", f"/Size {written.size}, as in the original.", False))
+    else:
+        why = ("the original's /Size is smaller than its highest object number + 1, which a valid file "
+               "cannot reproduce" if nb.src_size > trailer_size and written.size == nb.src_size else
+               "the output contains objects numbered above the original's range")
+        reports.append(("structure:objnum:size", "reconstructed", f"/Size is {written.size} (original "
+                        f"{trailer_size}): {why}.", True))
+    out_members = {n: k for k, ns in written.objstms.items() for n in ns}
+    present = {n for n, _ in nb.map.values()}
+    common = {n: k for n, k in membership.items() if n in present}
+    if membership or out_members:
+        exact = out_members == common
+        missing = len(membership) - len(common)
+        if exact and missing:
+            message = (f"Every object present in the output is in the same object stream as in the original; "
+                       f"{missing} of the original's compressed objects do not exist in the output.")
+        elif exact:
+            message = "Same objects in the same object streams as the original."
+        elif replicate:
+            message = ("The original's object-stream layout was followed; objects that exist only in the output "
+                       f"were placed in object stream {extra_k}.")
+        else:
+            message = f"Object streams: {mode}."
+        reports.append(("structure:objnum:objstm", "copied" if exact else "reconstructed", message,
+                        not exact or bool(missing)))
+    orig_x = f"stream, object {xref_nums[-1]}" if xref_nums else "classic table"
+    out_x = f"stream, object {written.xref_num}" if written.xref_num else "classic table"
+    reports.append(("structure:objnum:xref", "copied" if orig_x == out_x else "reconstructed",
+                    f"Cross-reference data: {out_x}.", orig_x != out_x))
+    return {"reports": reports, "id": ident, "header": header, "orig_header": orig_header,
+            "version": write_version, "objstm_mode": "same layout as the original" if replicate else mode,
+            "xref": out_x}
+
+
 def _output_password(opts: Options, second_password: str) -> str:
     if opts.encryption == "original":
         return opts.enc_user or opts.enc_owner
@@ -808,9 +944,21 @@ def copy_properties(original: Path, original_password: str, second: Path, second
             want_id = [bytes(x) for x in dst.trailer.ID]
         md = dst.Root.get("/Metadata")
         want_xmp = md.read_bytes() if is_obj(md, Stream) else None
-        # fix_metadata_version=False: pikepdf would otherwise re-serialize the XMP packet to update
-        # pdf:PDFVersion. The packet written is the one the user approved (verified below).
-        dst.save(output, fix_metadata_version=False, **save_kw)
+        orig_linearized = job.by_id.get("structure:linearized", {}).get("o", {}).get("display") == "Yes"
+        preserved = None
+        if opts.numbering == "preserve":
+            if opts.linearize:
+                notes.append("Linearization was requested, so qpdf wrote the file and renumbered the objects.")
+            else:
+                preserved = _write_preserving_numbers(src, dst, job, original, output, opts, enc, version,
+                                                      second_password, notes)
+        if preserved is None:
+            # fix_metadata_version=False: pikepdf would otherwise re-serialize the XMP packet to update
+            # pdf:PDFVersion. The packet written is the one the user approved (verified below).
+            dst.save(output, fix_metadata_version=False, **save_kw)
+        else:
+            save_kw = {"writer": "dittopdf (original object numbers)", "object_streams": preserved["objstm_mode"],
+                       "xref": preserved["xref"], "header_version": preserved["version"]}
 
     with Pdf.open(output, password=_output_password(opts, second_password)) as out:
         md = out.Root.get("/Metadata")
@@ -828,16 +976,44 @@ def copy_properties(original: Path, original_password: str, second: Path, second
                                     "method and permissions and the passwords you gave.",
                                     "second": "Second PDF's encryption kept."}[opts.encryption],
         }
+    if preserved is not None:
+        structure["structure:object_streams"] = f"Object streams: {preserved['objstm_mode']}."
     for id, msg in structure.items():
         if id in job.by_id:
             if id == "structure:encrypted" and not enc_ok:
                 job.report(job.by_id[id], "failed", "The writer did not produce the requested encryption.")
+            elif id == "structure:linearized" and orig_linearized and not opts.linearize:
+                job.report(job.by_id[id], "reconstructed", "Not linearized: the original's object numbers were "
+                           "kept instead (only qpdf's writer can linearize, and it renumbers objects). Choose "
+                           "'let the writer renumber' with linearization to get fast web view.", partial=True)
             else:
                 job.report(job.by_id[id], "reconstructed", msg)
 
+    for item in (preserved or {}).get("reports", []):
+        if item[0] in job.by_id:
+            job.report(job.by_id[item[0]], item[1], item[2], partial=item[3])
+    if preserved is None:
+        reason = ("linearization was requested" if opts.linearize and opts.numbering == "preserve" else
+                  "the 'let the writer renumber' option was chosen" if opts.numbering != "preserve" else
+                  "see the notes")
+        for row in job.rows:
+            if (row["id"].startswith("structure:objnum:") or row["id"].endswith(":objnum")) \
+                    and (row["o"]["present"] or row["s"]["present"]) and row["id"] not in job.done:
+                job.report(row, "regenerated", f"qpdf renumbered the objects because {reason}.")
+
     # File identifier: qpdf keeps the first element and regenerates the second.
     id_row = job.by_id.get("trailer:/ID")
-    if id_row is not None and "trailer:/ID" in job.done:
+    if preserved is not None and id_row is not None:
+        job.items = [i for i in job.items if i["id"] != "trailer:/ID"]
+        if preserved["id"] is None:
+            job.report(id_row, "copied", "No /ID written, like the original.")
+        elif id_row["o"]["present"] or id_row["s"]["present"] or job.action(id_row) == CUSTOM:
+            job.report(id_row, "overridden" if job.action(id_row) == CUSTOM else
+                       ("copied" if job.action(id_row) == COPY else "kept"),
+                       "Both /ID elements written exactly." + (" (The original has no /ID; one is required for "
+                       "encryption.)" if not id_row["o"]["present"] else ""),
+                       partial=not id_row["o"]["present"])
+    elif id_row is not None and "trailer:/ID" in job.done:
         pass  # already reported (no /ID in the original)
     elif id_row is not None and want_id is not None:
         action = job.action(id_row)
@@ -862,7 +1038,15 @@ def copy_properties(original: Path, original_password: str, second: Path, second
         job.report(id_row, "regenerated", "A new file identifier was generated.")
 
     header_row = job.by_id.get("structure:binary_marker")
-    if opts.header_mode == "match":
+    if preserved is not None:
+        if header_row is not None:
+            changed = preserved["header"] != preserved["orig_header"]
+            job.report(header_row, "copied" if opts.header_mode == "match" else "regenerated",
+                       ("Header bytes written exactly." + (f" The version was written as {preserved['version']}."
+                                                           if changed else ""))
+                       if opts.header_mode == "match" else "The 'writer default' header option was chosen.",
+                       partial=changed and opts.header_mode == "match")
+    elif opts.header_mode == "match":
         status, message = _reproduce_header(original, output, _output_password(opts, second_password))
         if header_row is not None and status is not None:
             outcome = {"exact": "copied", "rewritten": "copied", "failed": "failed"}[status]

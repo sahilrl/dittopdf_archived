@@ -165,8 +165,9 @@ def _verify(path: Path, candidate: bytes, desired: bytes, password: str) -> str 
         with pikepdf.open(path, password=password) as before, pikepdf.open(tmp, password=password) as after:
             if len(before.pages) != len(after.pages):
                 return "page count changed"
-            old = {o.objgen: o for o in before.objects if o is not None}
-            new = {o.objgen: o for o in after.objects if o is not None}
+            # pdf.objects yields indirect numbers/booleans as plain Python values (no objgen).
+            old = {o.objgen: o for o in before.objects if isinstance(o, pikepdf.Object)}
+            new = {o.objgen: o for o in after.objects if isinstance(o, pikepdf.Object)}
             if set(old) != set(new):
                 return "object set changed"
             for og, a in old.items():
