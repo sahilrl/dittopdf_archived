@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pikepdf
 import pytest
-from pikepdf import Dictionary, Name, Pdf
+from pikepdf import Array, Dictionary, Name, Pdf
 
 from dittopdf.services import copier, report, xmp
 from dittopdf.services.comparison import compare
@@ -497,3 +497,143 @@ def test_numbering_falls_back_when_verification_fails(orig, second, tmp_path, mo
     assert outcomes["structure:objnum:pages"]["outcome"] == "regenerated"
     with Pdf.open(out) as p:
         assert p.docinfo.Title == "Original Title" and not p.get_warnings()
+
+
+# ----------------------------------------------------------------------------- byte-level fidelity
+
+
+def _raw(path: Path, num: int) -> bytes:
+    from dittopdf.services.rawobjects import RawFile
+
+    return RawFile(path.read_bytes()).get(num).raw
+
+
+def test_itext_original_structure_reproduced(tmp_path):
+    from factory import make_itext_like, make_qpdf_like_second
+
+    orig = make_itext_like(tmp_path / "itext.pdf")
+    second = make_qpdf_like_second(tmp_path / "second.pdf")
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out)
+    data = out.read_bytes()
+
+    # Catalog, page tree, Info: byte-for-byte the original's objects.
+    for num in (1, 2, 10):
+        assert _raw(out, num) == _raw(orig, num), num
+    # No tags, named destinations, print scaling or mark info added.
+    with Pdf.open(out) as o, Pdf.open(orig) as src, Pdf.open(second) as sec:
+        assert sorted(o.Root.keys()) == ["/Pages", "/Type"]
+        assert not any("/StructParents" in p.obj for p in o.pages)
+        # The photo keeps the original's compressed bytes and number (the second PDF's pixels are the same).
+        img = o.pages[0].obj.Resources.XObject.img0
+        assert img.objgen == (4, 0) and img.read_raw_bytes() == src.get_object(4, 0).read_raw_bytes()
+        # Spacers copied byte for byte under their numbers and drawn where the original drew them.
+        xo = o.pages[0].obj.Resources.XObject
+        assert xo.img1.objgen == (5, 0) and xo.img1.SMask.objgen == (6, 0) and xo.img3.objgen == (9, 0)
+        assert xo.img2.objgen == (7, 0)  # visible original-only image: copied ...
+        contents = list(o.pages[0].obj.Contents)
+        drawn = contents[0].read_bytes()
+        assert b"/img1 Do" in drawn and b"5 0 0 5 300 300 cm /img1" in drawn and b"/img3 Do" in drawn
+        assert b"/img2" not in drawn  # ... but not drawn
+        assert contents[1].read_bytes() == sec.pages[0].obj.Contents.read_bytes()  # second's content untouched
+        assert not o.get_warnings() and not o.check_pdf_syntax()
+    for num in (4, 5, 6, 7, 9):
+        assert _raw(out, num) == _raw(orig, num), num
+    # The original's compact, unsorted style is used for re-written objects and the trailer.
+    assert b"3 0 obj\n<</Type/Page/MediaBox[0 0 595 842]/Parent 2 0 R/Resources<<" in data
+    assert b"/Contents[" in data and b"<< /" not in data
+    assert b"<</Root 1 0 R/ID [<" in data and b"0000000000 65535 f \n" in data
+    assert rep["objects"]["verbatim"] >= 8 and rep["objects"]["style"] == "compact"
+    assert outcomes["catalog:/StructTreeRoot"]["outcome"] == "removed"
+    assert any("Marked-content" in u for u in rep["unavoidable"])
+    assert any("Cross-reference offsets" in u for u in rep["unavoidable"])
+
+
+def test_original_images_option_none(tmp_path):
+    from factory import make_itext_like, make_qpdf_like_second
+
+    orig = make_itext_like(tmp_path / "itext.pdf")
+    second = make_qpdf_like_second(tmp_path / "second.pdf")
+    run(orig, second, tmp_path / "out.pdf", original_images="none", struct_tree="keep")
+    with Pdf.open(tmp_path / "out.pdf") as o:
+        assert set(o.pages[0].obj.Resources.XObject.keys()) == {"/img0"}
+        assert "/StructTreeRoot" in o.Root
+
+
+def test_catalog_entries_only_in_second_removed(tmp_path):
+    from factory import make_itext_like, make_qpdf_like_second
+
+    orig = make_itext_like(tmp_path / "itext.pdf")
+    second = tmp_path / "second.pdf"
+    make_qpdf_like_second(second)
+    with Pdf.open(second, allow_overwriting_input=True) as pdf:
+        pdf.Root.OCProperties = Dictionary(OCGs=Array(), D=Dictionary())
+        pdf.save(second)
+    rep, outcomes, cmp = run(orig, second, tmp_path / "out.pdf")
+    assert {r["id"]: r for r in cmp["rows"]}["catalog:/OCProperties"]["default"] == "copy"
+    with Pdf.open(tmp_path / "out.pdf") as o:
+        assert "/OCProperties" not in o.Root
+
+
+def test_reuses_original_encryption(tmp_path, second):
+    orig = tmp_path / "enc.pdf"
+    make_original(tmp_path / "plain.pdf", incremental=False)
+    with Pdf.open(tmp_path / "plain.pdf") as pdf:
+        pdf.save(orig, encryption=pikepdf.Encryption(owner="secret-owner", user="u", R=4, aes=True))
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(orig, second, out, orig_pw="u")
+    assert any("reused" in n for n in rep["notes"])
+    with Pdf.open(out, password="secret-owner") as o:  # the original's owner password still works
+        assert o.owner_password_matched and o.docinfo.Title == "Original Title"
+    with Pdf.open(out, password="u") as o, Pdf.open(orig, password="u") as src:
+        assert bytes(o.trailer.Encrypt.O) == bytes(src.trailer.Encrypt.O)
+        assert not o.get_warnings()
+    assert rep["objects"]["verbatim"] > 0
+
+
+def test_unchanged_object_stream_copied_verbatim(tmp_path):
+    from dittopdf.services.rawobjects import RawFile
+
+    src = tmp_path / "objstm.pdf"
+    with Pdf.new() as pdf:
+        pdf.add_blank_page()
+        pdf.docinfo.Title = "Same"
+        pdf.Root.PageLayout = Name.OneColumn
+        pdf.save(src, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    # Second PDF: the same document saved again (identical objects).
+    second = tmp_path / "second.pdf"
+    with Pdf.open(src) as pdf:
+        pdf.save(second)
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(src, second, out)
+    a, b = RawFile(src.read_bytes()), RawFile(out.read_bytes())
+    stms = {e[1] for e in a.entries.values() if e[0] == "c"}
+    assert rep["objects"]["objstm_verbatim"] >= 1
+    for k in stms:
+        assert b.get(k).raw == a.get(k).raw
+
+
+def test_self_copy_of_quirky_layout_is_byte_identical(tmp_path):
+    from factory import make_quirky_layout
+
+    src = make_quirky_layout(tmp_path / "quirky.pdf")
+    with Pdf.open(src) as p:
+        assert not p.get_warnings()
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(src, src, out)
+    assert rep["objects"]["verbatim"] == 5 and rep["objects"]["restyled"] == 0
+    assert out.read_bytes() == src.read_bytes()
+
+
+def test_identical_content_keeps_original_object_stream_bytes(tmp_path):
+    src = tmp_path / "objstm.pdf"
+    with Pdf.new() as pdf:
+        for _ in range(3):
+            pdf.add_blank_page()
+        pdf.docinfo.Title = "Streams"
+        pdf.save(src, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    out = tmp_path / "out.pdf"
+    rep, outcomes, _ = run(src, src, out)
+    assert rep["objects"]["objstm_verbatim"] >= 1 and rep["objects"]["fresh"] == 0
+    with Pdf.open(out) as o:
+        assert not o.get_warnings() and len(o.pages) == 3

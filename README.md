@@ -84,7 +84,7 @@ Every property is classified, and the classification is shown in the UI:
 | **Copyable with reconstruction** | XMP properties, outlines, named destinations, page labels, open action, embedded files, output intents, PieceInfo, document parts, `/ID` | deep-copied into the output, with **page references remapped to the same page number** and shared/cyclic objects kept consistent |
 | **Read-only / diagnostic** | fonts, images, signatures, filesystem data | shown, never modified |
 | **Must be regenerated** | `/Prev`, xref offsets, object count, file hash | produced by the PDF writer |
-| **Cannot reliably be reproduced** | structure tree, optional content, thumbnails, `/Perms`, `/DSS`, single-element `/ID` | kept from the second PDF unless you opt in |
+| **Cannot reliably be reproduced** | structure tree, optional content, thumbnails, `/Perms`, `/DSS`, single-element `/ID` | if the original has none, removed so the output matches it; if both have one, the second PDF's is kept unless you opt in |
 
 What this means in practice:
 
@@ -98,9 +98,39 @@ What this means in practice:
   with lxml, so unrelated properties and custom schemas are preserved. pikepdf's
   automatic XMP rewrite during save is disabled (`fix_metadata_version=False`),
   and the written packet is verified.
-- **Object numbers.** qpdf renumbers every object when it writes a file, so by
-  default dittopdf writes the output itself (`pdfwriter.py`) so object numbers
-  match the original's:
+- **Byte-level fidelity.** qpdf renumbers every object and re-serializes it in
+  its own style (spaced, keys sorted) when it writes a file. So by default
+  dittopdf writes the output itself (`pdfwriter.py`), reading the original's
+  bytes directly (`rawobjects.py`):
+  - An object identical to the original object with the same number is copied
+    **byte for byte** from the original file, stream data included. Unchanged
+    object streams are copied verbatim too.
+  - A changed object is re-written only where it changed, in the original's
+    style (compact `<</Type/Catalog>>` or spaced, line endings, separators
+    around `obj`/`stream`/`endobj`), keeping its key order, number formatting
+    (`612` vs `612.0`) and string form for every unchanged part.
+  - Objects with no original counterpart (the second PDF's content) are also
+    written in the original's style.
+  - Objects follow the original's physical order, and the trailer and
+    cross-reference data follow its format (xref entry line endings, xref
+    stream field widths, predictor and compression level).
+- **Compression.** dittopdf never recompresses streams. When one of the second
+  PDF's streams decodes to exactly the same data as an original stream (same
+  image pixels, same page content, same font file), it takes the original's
+  encoded bytes, filters and object number. The stored size then matches too.
+- **Images only the original has**, such as JasperReports' 1×1 transparent
+  spacer images, are copied byte for byte under their original numbers. Those
+  that can't change the page's appearance (fully transparent soft mask or a
+  colour-key mask covering every pixel) are drawn at their original positions
+  by a small content stream placed before the second PDF's own content
+  streams, which stay unchanged. Visible ones are copied into the page
+  resources but not drawn, because that would change the page.
+- **Matching the original's catalog.** If the original has no structure tree,
+  the second PDF's tags and their references are removed. The marked-content
+  operators inside its page content remain, and the report says so. Catalog
+  entries the original lacks (named destinations, viewer preferences, mark
+  info, optional content, an interactive form…) are removed by default.
+- **Object numbers.** In the same writer, object numbers match the original's:
   - Objects that *are* the original's keep their number and generation: the
     catalog, Info, page tree, pages by number, the XMP stream, and every object
     copied from the original.
@@ -110,36 +140,43 @@ What this means in practice:
   - Object streams follow the original's layout (same members in the same
     stream numbers), and the cross-reference table or stream (with its number)
     and `/Size` match where possible.
-  - Encrypted output is supported (RC4 and AES; qpdf derives the key and
-    dittopdf encrypts each object under its own number), and `/ID` is then
-    exact too.
+  - Encrypted output is supported (RC4 and AES; each object is encrypted under
+    its own number), and `/ID` is then exact too.
   - Every file is reopened and compared object by object before it's kept; if
     anything differs, qpdf writes the file instead and the report explains why.
   - Linearization needs qpdf's writer, so it's off by default when numbers are
     kept. Choose *let the writer renumber* to linearize.
-- **Header bytes.** The original's header line and binary-marker comment
-  (e.g. `%PDF-1.7\r\n%âãÏÓ\r\n`) are reproduced byte for byte, line endings
-  included. qpdf always writes its own header, so the block is replaced after
-  saving. If the length differs, all object offsets are shifted and the
-  cross-reference table or stream is corrected. The result is reopened and
-  every object is compared before it's kept. Linearized output can only be
-  rewritten when the lengths are equal; otherwise this is reported as not
-  reproduced. Bytes before `%PDF-` are not reproduced.
-- **`/ID`.** qpdf keeps the first element and regenerates the second. By default,
-  dittopdf then reproduces the second element exactly using a same-length
-  substitution, and verifies the result. This isn't possible for encrypted
-  output.
-- **Encryption.** Passwords can't be read out of a PDF. When the original is
-  encrypted, the output defaults to the original's revision and permissions,
-  with the user password you opened it with and a random owner password (shown
-  in the report) unless you set one.
+- **Header bytes.** The original's header line, binary-marker comment and any
+  blank lines before the first object (e.g. `%PDF-1.7\r\n%âãÏÓ\r\n`) are
+  written byte for byte. When qpdf writes the file instead (linearization, or
+  *let the writer renumber*), its header is replaced after saving: object
+  offsets are shifted and the cross-reference data is corrected, and the
+  result is verified. Linearized output can only be rewritten when the
+  lengths are equal. Bytes before `%PDF-` are not reproduced.
+- **`/ID`** is written exactly by dittopdf's writer. When qpdf writes the file,
+  it keeps the first element and regenerates the second; dittopdf then
+  reproduces the second element with a verified same-length substitution
+  (not possible for encrypted output on that path).
+- **Encryption.** When the original is encrypted and you don't change the
+  passwords or permissions, the original's encryption dictionary and file key
+  are reused. The output opens with the original's user *and* owner passwords,
+  and unchanged encrypted objects can be copied byte for byte. If you set new
+  passwords, they're used instead; a blank owner password then gets a random
+  one, shown in the report.
+- **Unavoidable differences** are listed on the result page. They include:
+  cross-reference offsets; several revisions collapsed into one; second-PDF
+  streams whose content differs from every original stream; marked content
+  left in the second PDF's content streams; objects that only the original had
+  and the output can't contain. The page also counts objects that are
+  byte-identical to the original, re-written, or new.
 
 ### Output options
 
 | Option | Choices |
 |---|---|
-| Annotations & forms | keep the second PDF's (default; comment metadata is copied onto matching annotations) · replace with the original's · add the original's |
-| Structure tree | keep the second PDF's (default) · copy the original's (only correct if the content is the same) |
+| Annotations & forms | keep the second PDF's (default; comment metadata is copied onto matching annotations, and the form dictionary is removed if the original has none) · replace with the original's · add the original's |
+| Structure tree | match the original (default: removed if the original is untagged, otherwise the second PDF's is kept) · keep the second PDF's · copy the original's (only correct if the content is the same) |
+| Images only the original has | copy them and draw the invisible ones (default) · don't copy them |
 | File identifier | reproduce both elements (default) · keep the first, regenerate the second |
 | Metadata consistency | write Info overrides into the matching XMP properties (default on) |
 | File structure | object numbers (keep the original's · let the writer renumber), header version (defaults to the original's), header bytes (match the original · writer default), linearization (needs the writer to renumber), object streams (defaults to match the original), compress uncompressed streams |
@@ -179,9 +216,10 @@ src/dittopdf/
 │   ├── xmp.py         # XMP parsing / editing (lxml)
 │   ├── pdfobj.py      # pikepdf ↔ typed JSON, display, canonical digests
 │   ├── rawfile.py     # byte-level structure: header, revisions, /Prev chain
+│   ├── rawobjects.py  # objects read straight from the bytes: spans, key order, style
 │   ├── headerfix.py   # reproduce header bytes after a qpdf save (offset correction)
 │   ├── numbering.py   # output object numbers matching the original's
-│   ├── pdfwriter.py   # writer keeping those numbers (object streams, xref, encryption)
+│   ├── pdfwriter.py   # writer keeping numbers, bytes and style (object streams, xref, encryption)
 │   ├── resources.py   # font/image discovery, image placement & DPI
 │   ├── fonts.py       # embedded font programs (fontTools)
 │   ├── signatures.py  # signature fields and certificates (cryptography)

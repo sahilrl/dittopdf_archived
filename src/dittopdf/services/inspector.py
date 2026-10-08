@@ -306,6 +306,7 @@ def inspect_pdf(path: str | Path, password: str = "", *, filename: str = "", fs:
                           if e["id"].startswith("sig:")),
             "warnings": (warnings + _warnings(pdf))[:50],
             "detail_pages": min(len(pdf.pages), max_pages),
+            "tagged": "/StructTreeRoot" in pdf.Root,
         }
     return {"summary": summary, "entries": ctx.entries}
 

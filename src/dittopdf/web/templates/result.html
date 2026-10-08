@@ -40,6 +40,25 @@
   {% for n in res.notes %}<div class="callout info">{{ n }}</div>{% endfor %}
 </div>
 
+{% if res.objects %}
+<h2>Objects</h2>
+<div class="panel">
+  <div class="summary-grid">
+    <div class="stat"><div class="k">Byte-for-byte identical to the original object</div><div class="v">{{ res.objects.verbatim }}</div></div>
+    <div class="stat"><div class="k">Original objects re-written (changed parts only)</div><div class="v">{{ res.objects.restyled }}</div></div>
+    <div class="stat"><div class="k">Objects with no original counterpart</div><div class="v">{{ res.objects.fresh }}</div></div>
+    <div class="stat"><div class="k">Object streams copied verbatim</div><div class="v">{{ res.objects.objstm_verbatim }}</div></div>
+    <div class="stat"><div class="k">Serialization style (from the original)</div><div class="v">{{ res.objects.style }}</div></div>
+  </div>
+</div>
+{% endif %}
+{% if res.unavoidable %}
+<h2>Unavoidable differences</h2>
+<div class="panel">
+  <ul>{% for u in res.unavoidable %}<li>{{ u }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
 <h2>Verification: output re-inspected and compared</h2>
 <div class="panel">
   <table class="files">

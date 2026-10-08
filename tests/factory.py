@@ -282,3 +282,119 @@ def make_with_header(path: Path, header: bytes, eol: bytes = b"\n") -> Path:
     out += b"startxref" + eol + b"%d" % xref + eol + b"%%EOF" + eol
     path.write_bytes(bytes(out))
     return path
+
+
+def _assemble(objects: dict[int, bytes], trailer: bytes, header: bytes = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n",
+              entry_eol: bytes = b" \n") -> bytes:
+    """Lay out ``objects`` (num -> full 'N 0 obj ... endobj\\n' bytes) with a classic xref table."""
+    out = bytearray(header)
+    offsets = {}
+    for n in sorted(objects):
+        offsets[n] = len(out)
+        out += objects[n]
+    size = max(objects) + 1
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f" % size + entry_eol
+    for n in range(1, size):
+        out += (b"%010d 00000 n" % offsets[n] if n in offsets else b"0000000000 00000 f") + entry_eol
+    out += b"trailer\n" + trailer.replace(b"SIZE", b"%d" % size) + b"\nstartxref\n%d\n%%%%EOF\n" % xref
+    return bytes(out)
+
+
+def _obj(n: int, body: bytes) -> bytes:
+    return b"%d 0 obj\n" % n + body + b"\nendobj\n"
+
+
+def _stream_obj(n: int, dict_body: bytes, data: bytes) -> bytes:
+    # iText style: "<<...>>stream\n<data>\nendstream"
+    return b"%d 0 obj\n<<" % n + dict_body + b"/Length %d>>stream\n" % len(data) + data + b"\nendstream\nendobj\n"
+
+
+PHOTO = bytes((x * 7 + y * 3) % 256 for y in range(40) for x in range(64 * 3))
+
+
+def make_itext_like(path: Path) -> Path:
+    """A compact iText/JasperReports-style original with transparent 1×1 spacer images."""
+    import zlib
+
+    content = (b"q 64 0 0 40 100 700 cm /img0 Do Q\n"
+               b"q 1 0 0 1 10 10 cm /img1 Do Q\nq 5 0 0 5 300 300 cm /img1 Do Q\n"
+               b"q 1 0 0 1 50 50 cm /img3 Do Q\nq 20 0 0 20 400 400 cm /img2 Do Q\n")
+    objects = {
+        1: _obj(1, b"<</Type/Catalog/Pages 2 0 R>>"),
+        2: _obj(2, b"<</Type/Pages/Count 1/Kids[3 0 R]>>"),
+        3: _obj(3, b"<</Type/Page/MediaBox[0 0 595 842]/Parent 2 0 R/Resources<</ProcSet[/PDF/ImageC]"
+                   b"/XObject<</img0 4 0 R/img1 5 0 R/img2 7 0 R/img3 9 0 R>>>>/Contents 8 0 R>>"),
+        4: _stream_obj(4, b"/Type/XObject/Subtype/Image/Width 64/Height 40/ColorSpace/DeviceRGB"
+                          b"/BitsPerComponent 8/Filter/FlateDecode", zlib.compress(PHOTO, 1)),
+        # Transparent spacer: white pixel with an all-zero soft mask (JasperReports' px image).
+        5: _stream_obj(5, b"/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB"
+                          b"/BitsPerComponent 8/SMask 6 0 R/Filter/FlateDecode", zlib.compress(b"\xff\xff\xff")),
+        6: _stream_obj(6, b"/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceGray"
+                          b"/BitsPerComponent 8/Filter/FlateDecode", zlib.compress(b"\x00")),
+        # A visible original-only image.
+        7: _stream_obj(7, b"/Type/XObject/Subtype/Image/Width 2/Height 2/ColorSpace/DeviceRGB"
+                          b"/BitsPerComponent 8/Filter/FlateDecode", zlib.compress(b"\xff\x00\x00" * 4)),
+        8: _stream_obj(8, b"/Filter/FlateDecode", zlib.compress(content)),
+        # Second spacer kind: colour-key masked white pixel.
+        9: _stream_obj(9, b"/Type/XObject/Subtype/Image/Width 1/Height 1/ColorSpace/DeviceRGB"
+                          b"/BitsPerComponent 8/Mask[255 255 255 255 255 255]/Filter/FlateDecode",
+                       zlib.compress(b"\xff\xff\xff")),
+        10: _obj(10, b"<</Producer(iText 2.1.7 by 1T3XT)/CreationDate(D:20240101120000+01'00')"
+                     b"/Creator(JasperReports Library version 6.20.0)>>"),
+    }
+    ident = b"<" + b"ab" * 16 + b"><" + b"ab" * 16 + b">"
+    path.write_bytes(_assemble(objects, b"<</Root 1 0 R/ID [" + ident + b"]/Info 10 0 R/Size SIZE>>"))
+    return path
+
+
+def make_qpdf_like_second(path: Path, *, tags: int = 40) -> Path:
+    """The same page re-rendered by another pipeline: same photo (other compression), no spacers,
+    a tag tree, named destinations, print scaling, spaced/sorted qpdf formatting."""
+    import zlib
+
+    pdf = Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    page = pdf.pages[0].obj
+    img = pdf.make_stream(b"", Type=Name.XObject, Subtype=Name.Image, Width=64, Height=40,
+                          ColorSpace=Name.DeviceRGB, BitsPerComponent=8)
+    img.write(zlib.compress(PHOTO, 9), filter=Name.FlateDecode)
+    page.Resources = Dictionary(XObject=Dictionary(img0=img))
+    page.Contents = pdf.make_stream(b"/P <</MCID 0>> BDC q 64 0 0 40 100 700 cm /img0 Do Q EMC\n")
+    page.StructParents = 0
+    kids = [pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, Pg=page, K=i)) for i in range(tags)]
+    pdf.Root.StructTreeRoot = Dictionary(Type=Name.StructTreeRoot, K=kids,
+                                         ParentTree=Dictionary(Nums=[0, Array(kids)]))
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    pdf.Root.ViewerPreferences = Dictionary(PrintScaling=Name("/None"))
+    pdf.Root.Names = pdf.make_indirect(Dictionary(Dests=Dictionary(Names=[String("top"), Array([page, Name.Fit])])))
+    pdf.docinfo.Producer = "Some other renderer"
+    pdf.save(path)
+    return path
+
+
+def make_quirky_layout(path: Path) -> Path:
+    """Layout details writers vary in: a blank line after the header, "endobj \\n", and an indirect
+    /Length object written right after its stream."""
+    import zlib
+
+    content = zlib.compress(b"BT /F1 12 Tf 72 700 Td (quirky) Tj ET")
+    parts = {
+        1: b"1 0 obj \n<<\n/Type /Catalog\n/Pages 2 0 R\n>>\nendobj \n",
+        2: b"2 0 obj \n<<\n/Type /Pages\n/Kids [3 0 R]\n/Count 1\n>>\nendobj \n",
+        3: b"3 0 obj \n<<\n/Type /Page\n/Parent 2 0 R\n/MediaBox [0 0 300 300]\n/Resources <<\n>>\n/Contents 4 0 R\n>>\nendobj \n",
+        4: b"4 0 obj \n<<\n/Length 5 0 R\n/Filter /FlateDecode\n>>\nstream\n" + content + b"\nendstream\nendobj \n",
+        5: b"5 0 obj \n%d\nendobj \n" % len(content),
+        6: b"6 0 obj \n<<\n/Producer (Quirky Writer)\n>>\nendobj \n",
+    }
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n\n")
+    offsets = {}
+    for n in sorted(parts):
+        offsets[n] = len(out)
+        out += parts[n]
+    xref = len(out)
+    out += b"xref\n0 7\n0000000000 65535 f\r\n" + b"".join(b"%010d 00000 n\r\n" % offsets[n] for n in range(1, 7))
+    out += (b"trailer\n<<\n/Size 7\n/Root 1 0 R\n/Info 6 0 R\n/ID [<" + b"cd" * 16 + b"> <" + b"cd" * 16
+            + b">]\n>>\nstartxref\n%d\n%%%%EOF\n" % xref)
+    path.write_bytes(bytes(out))
+    return path

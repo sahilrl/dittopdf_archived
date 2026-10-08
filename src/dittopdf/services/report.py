@@ -81,6 +81,8 @@ def build_result(orig: dict, second: dict, output: dict, rows: list[dict], copy:
         "verify_counts": {k: len(v) for k, v in verify.items()},
         "verify_by_section": _by_section(verify),
         "notes": copy["notes"],
+        "unavoidable": copy.get("unavoidable", []),
+        "objects": copy.get("objects"),
         "save": copy["save"],
         "files": [("Original", o_sum), ("Second PDF", s_sum), ("Output", x_sum)],
         "byte_identical": identical,

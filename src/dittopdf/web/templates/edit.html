@@ -69,6 +69,7 @@
         Signature fields are copied unsigned.</p>
     </fieldset>
     <fieldset class="opt radio-list"><legend>Structure tree (tags)</legend>
+      <label><input type="radio" name="opt_struct_tree" value="match" {% if opts.struct_tree == 'match' %}checked{% endif %}> Match the original{% if not orig.summary.get('tagged') %} (it has no tags: the second PDF’s tag tree is removed){% endif %}</label>
       <label><input type="radio" name="opt_struct_tree" value="keep" {% if opts.struct_tree == 'keep' %}checked{% endif %}> Keep the second PDF’s tags</label>
       <label><input type="radio" name="opt_struct_tree" value="copy" {% if opts.struct_tree == 'copy' %}checked{% endif %}> Copy the original’s structure tree</label>
       <p class="help">Tags point into the page content. Copy them only if both PDFs have the same content
@@ -79,6 +80,13 @@
       <label><input type="radio" name="opt_id_mode" value="first" {% if opts.id_mode == 'first' %}checked{% endif %}> Keep the first element, regenerate the second (PDF spec behaviour for a modified file)</label>
       <p class="help">Exact reproduction is done by a same-length substitution after writing and is verified; it is
         not possible for encrypted output.</p>
+    </fieldset>
+    <fieldset class="opt radio-list"><legend>Images only the original has</legend>
+      <label><input type="radio" name="opt_original_images" value="invisible" {% if opts.original_images == 'invisible' %}checked{% endif %}> Copy them byte for byte under their original numbers; draw the invisible ones (e.g. 1×1 transparent spacers) at their original positions</label>
+      <label><input type="radio" name="opt_original_images" value="none" {% if opts.original_images == 'none' %}checked{% endif %}> Don’t copy them</label>
+      <p class="help">Invisible images are drawn by a small extra content stream placed before the second PDF’s own
+        content streams, which stay unchanged. Visible images are copied into the page resources but not drawn,
+        because drawing them would change the page.</p>
     </fieldset>
     <fieldset class="opt"><legend>Metadata consistency</legend>
       <label class="check"><input type="checkbox" name="opt_propagate_xmp" {% if opts.propagate_xmp %}checked{% endif %}>

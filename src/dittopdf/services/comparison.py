@@ -106,10 +106,31 @@ def compare(orig: dict, second: dict) -> dict[str, Any]:
             "s": _side(s),
         }
         row["status"] = _status(o, s)
+        _match_original_default(row)
         _feasibility(row, o_map, s_map, o_pages, s_pages)
         rows.append(row)
     return {"rows": rows, "tree": build_tree(rows), "counts": _counts(rows),
             "warnings": _warnings(orig, second)}
+
+
+def _match_original_default(row: dict) -> None:
+    """A property only the second PDF has defaults to removal, so the output matches the original.
+
+    Content-bound entries (optional content, permissions, signature data, thumbnails) default to
+    "keep" when both PDFs have them; when the original has none, matching it means removing them.
+    """
+    if row["status"] != "only_second" or row["default"] != KEEP:
+        return
+    if COPY in row["actions"]:
+        row["default"] = COPY
+    elif REMOVE in row["actions"]:
+        row["default"] = REMOVE
+    else:
+        return
+    extra = " The original has none, so it is removed by default to match the original."
+    if row["id"] == "catalog:/OCProperties":
+        extra += " Content that uses optional content groups then always shows."
+    row["note"] = (row["note"] + extra).strip()
 
 
 def _feasibility(row: dict, o_map: dict, s_map: dict, o_pages: int, s_pages: int) -> None:

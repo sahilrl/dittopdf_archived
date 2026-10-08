@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from typing import Any
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
-from dittopdf.services import headerfix, numbering, pdfobj, pdfwriter, rawfile, resources, xmp
+from dittopdf.services import headerfix, numbering, pdfobj, pdfwriter, rawfile, rawobjects, resources, xmp
 from dittopdf.services.model import (
     COPY, CUSTOM, DIRECT, KEEP, READONLY, RECONSTRUCT, REGENERATE, REMOVE, UNREPRODUCIBLE,
 )
@@ -54,7 +55,8 @@ class PlanError(ValueError):
 @dataclass
 class Options:
     annotations: str = "keep"          # keep | replace | merge
-    struct_tree: str = "keep"          # keep | copy
+    struct_tree: str = "match"         # match (remove if the original has none) | keep | copy
+    original_images: str = "invisible"  # copy original-only images; draw the invisible ones | none
     id_mode: str = "exact"             # exact | first
     header_mode: str = "match"         # match | writer (header line + binary marker bytes)
     numbering: str = "preserve"        # preserve (original's object numbers) | writer (qpdf renumbers)
@@ -291,6 +293,9 @@ class Job:
     # -- sections --------------------------------------------------------------------------
 
     def run(self) -> None:
+        self.identity_pairs: list[tuple[Any, Any]] = []
+        self.unavoidable: list[str] = []
+        self.spacers: list[str] = []
         self.do_annotations_mode()
         self.do_catalog()
         self.do_struct_tree()
@@ -300,6 +305,8 @@ class Job:
         self.do_info()
         self.do_xmp()
         self.do_trailer()
+        self.do_original_images()
+        self.do_identical_streams()
         if self.tr.dropped_pages:
             self.notes.append("References to original page(s) " + ", ".join(map(str, sorted(self.tr.dropped_pages)))
                               + " were set to null because the second PDF has no such page.")
@@ -333,7 +340,12 @@ class Job:
                     if j < len(da) and is_obj(a, Dictionary) and is_obj(da[j], Dictionary) and a.is_indirect \
                             and a.get("/Subtype") == da[j].get("/Subtype"):
                         self.tr.remap[a.objgen] = da[j]
-            if acro_row.get("o", {}).get("present") or acro_row.get("s", {}).get("present"):
+            if "/AcroForm" not in src.Root and "/AcroForm" in dst.Root:
+                del dst.Root["/AcroForm"]
+                self.report(acro_row, "removed", "The original has no interactive form, so the catalog's /AcroForm "
+                            "was removed to match it. The second PDF's widget annotations remain and still render, "
+                            "but are no longer interactive form fields.")
+            elif acro_row.get("o", {}).get("present") or acro_row.get("s", {}).get("present"):
                 self.report(acro_row, "kept", "Annotations & forms option: keep the second PDF's.")
             return
         copied = 0
@@ -415,6 +427,9 @@ class Job:
         if row is None:
             return
         tagged = self.by_id.get("structure:tagged")
+        if self.opts.struct_tree == "match" and "/StructTreeRoot" not in self.src.Root:
+            self._remove_tags(row, tagged)
+            return
         if tagged is not None:
             self.report(tagged, "reconstructed" if self.opts.struct_tree == "copy" else "kept",
                         "Follows the 'Structure tree' output option.")
@@ -443,6 +458,169 @@ class Job:
             r = self.by_id.get(f"page:{i + 1}:/StructParents")
             if r and (r["o"]["present"] or r["s"]["present"]):
                 self.report(r, "reconstructed" if "/StructParents" in sp else "removed")
+
+    def _remove_tags(self, row: dict, tagged: dict | None) -> None:
+        """The original is untagged: remove the second PDF's structure tree and its back-references."""
+        dst = self.dst
+        had = "/StructTreeRoot" in dst.Root
+        if had:
+            del dst.Root["/StructTreeRoot"]
+        refs = 0
+        for o in numbering.reachable(dst):
+            d = o.stream_dict if is_obj(o, Stream) else o if is_obj(o, Dictionary) else None
+            if d is None:
+                continue
+            for key in ("/StructParents", "/StructParent"):
+                if key in d:
+                    del d[key]
+                    refs += 1
+        for r in self.rows:
+            if r["id"].endswith(":/StructParents") or r["id"].endswith(":/StructParent"):
+                if r["s"]["present"] or r["o"]["present"]:
+                    self.report(r, "removed", "The original is not tagged.")
+        msg = (f"The original has no structure tree, so the second PDF's tag tree and {refs} reference(s) to it "
+               "were removed." if had else "Neither PDF is tagged.")
+        if had or row["o"]["present"] or row["s"]["present"]:
+            self.report(row, "removed" if had else "copied", msg)
+        if tagged is not None:
+            self.report(tagged, "copied", msg)
+        if had and any(b"BDC" in _content_bytes(p) for p in dst.pages[:50]):
+            self.unavoidable.append("Marked-content operators (BDC … EMC with MCIDs) remain inside the second "
+                                    "PDF's page content streams. Removing them would rewrite its content; without a "
+                                    "structure tree, viewers ignore them.")
+
+    def do_identical_streams(self) -> None:
+        """Give second-PDF streams whose content equals an original stream the original's encoded bytes.
+
+        Decoded data and dictionary (apart from /Length, /Filter, /DecodeParms) must be identical;
+        the original's compressed bytes and filters are then used, and the pair becomes a numbering
+        counterpart so the object also keeps the original's number.
+        """
+        index: dict[str, list[Any]] = {}
+        for o in self.src.objects:
+            if is_obj(o, Stream) and o.stream_dict.get("/Type") not in (Name.XRef, Name.ObjStm):
+                try:
+                    key = pdfobj.canonical(o)
+                except Exception:
+                    continue
+                if not key.startswith("partial:"):
+                    index.setdefault(key, []).append(o)
+        claimed = set(self.tr.memo) | set(self.tr.remap)
+        own = {d.objgen for d in self.tr.memo.values() if is_obj(d, pikepdf.Object)}
+        own |= {d.objgen for d in self.tr.remap.values() if is_obj(d, pikepdf.Object)}
+        swapped = paired = unmatched = 0
+        delta = 0
+        for d in numbering.reachable(self.dst):
+            if not is_obj(d, Stream) or d.objgen in own:
+                continue
+            try:
+                key = pdfobj.canonical(d)
+            except Exception:
+                continue
+            cands = [s for s in index.get(key, []) if s.objgen not in claimed]
+            if not cands:
+                unmatched += 1
+                continue
+            s = cands[0]
+            claimed.add(s.objgen)
+            raw_s, raw_d = s.read_raw_bytes(), d.read_raw_bytes()
+            same_filters = pdfobj.canonical(s.stream_dict.get("/Filter")) == pdfobj.canonical(
+                d.stream_dict.get("/Filter")) and pdfobj.canonical(s.stream_dict.get("/DecodeParms")) == \
+                pdfobj.canonical(d.stream_dict.get("/DecodeParms"))
+            if raw_s != raw_d or not same_filters:
+                filt, parms = s.stream_dict.get("/Filter"), s.stream_dict.get("/DecodeParms")
+                d.write(raw_s, filter=self.tr.copy(filt) if filt is not None else None,
+                        decode_parms=self.tr.copy(parms) if parms is not None else None, type_check=False)
+                swapped += 1
+                delta += len(raw_s) - len(raw_d)
+            self.identity_pairs.append((s, d))
+            paired += 1
+        if swapped:
+            self.notes.append(f"Compression: {swapped} stream(s) of the second PDF decode to exactly the same data "
+                              "as an original stream and now use the original's encoded bytes and filters "
+                              f"({delta:+,} bytes in total).")
+        if paired:
+            self.notes.append(f"{paired} second-PDF stream(s) are identical in content to an original stream and "
+                              "take that stream's object number.")
+        if unmatched:
+            self.unavoidable.append(f"{unmatched} stream(s) of the second PDF (page content, images, fonts…) have "
+                                    "no original stream with identical decoded content, so their bytes are the "
+                                    "second PDF's.")
+
+    def do_original_images(self) -> None:
+        """Copy images that only the original has; draw the invisible ones (spacers) where the original did."""
+        if self.opts.original_images == "none":
+            return
+        n = min(len(self.src.pages), len(self.dst.pages), self.max_pages)
+        try:
+            src_res = resources.collect(self.src, n)
+            dst_res = resources.collect(self.dst, n)
+        except Exception:
+            return
+        on_page: dict[int, set[str]] = {}
+        for f in dst_res.images.values():
+            try:
+                key = pdfobj.canonical(f.obj)
+            except Exception:
+                continue
+            for p in f.pages:
+                on_page.setdefault(p, set()).add(key)
+        ops: dict[int, list[bytes]] = {}
+        for f in src_res.images.values():
+            if not f.placements:
+                continue  # masks and unused images come along with the image using them
+            try:
+                key = pdfobj.canonical(f.obj)
+            except Exception:
+                continue
+            invisible = _invisible(f.obj)
+            for page in sorted({pl["page"] for pl in f.placements}):
+                if page > n or key in on_page.get(page, set()):
+                    continue
+                on_page.setdefault(page, set()).add(key)
+                copy = self.tr.copy(f.obj)
+                if copy is None:
+                    continue
+                pls = [pl for pl in f.placements if pl["page"] == page]
+                name = _add_xobject(self.dst.pages[page - 1].obj, pls[0]["name"], copy)
+                drawn = [pl for pl in pls if invisible or pl["width_pt"] == 0 or pl["height_pt"] == 0]
+                for pl in drawn:
+                    m = b" ".join(_fmt(x) for x in pl["matrix"])
+                    ops.setdefault(page, []).append(b"q " + m + b" cm " + Name(name).unparse() + b" Do Q")
+                desc = (f"page {page}: original image {f.obj.objgen[0]} {f.obj.objgen[1]} "
+                        f"({f.obj.get('/Width')}×{f.obj.get('/Height')} px) copied as {name}")
+                if drawn:
+                    desc += f", drawn {len(drawn)}× at its original position(s) (invisible: it cannot change the page)"
+                else:
+                    desc += ", not drawn (it is visible, and drawing it would change the second PDF's page)"
+                self.spacers.append(desc)
+        for page, lines in ops.items():
+            self._prepend_content(page, b"\n".join(lines) + b"\n")
+        if self.spacers:
+            self.notes.append("Original-only images: " + "; ".join(self.spacers) + ".")
+
+    def _prepend_content(self, page: int, data: bytes) -> None:
+        """Add a content stream before the page's own, leaving the second PDF's streams untouched."""
+        po = self.dst.pages[page - 1].obj
+        src_contents = self.src.pages[page - 1].obj.get("/Contents")
+        first = src_contents[0] if is_obj(src_contents, Array) and len(src_contents) else src_contents
+        new = self.dst.make_stream(data)
+        if is_obj(first, Stream) and first.stream_dict.get("/Filter") == Name.FlateDecode:
+            level = None
+            try:
+                level = rawobjects.zlib_level(first.read_raw_bytes(), first.read_bytes())
+            except Exception:
+                pass
+            new.write(zlib.compress(data, level if level is not None else 6), filter=Name.FlateDecode)
+        cur = po.get("/Contents")
+        if cur is None:
+            po.Contents = new
+        elif is_obj(cur, Array):
+            po.Contents = Array([new] + list(cur))
+        else:
+            po.Contents = Array([new, cur])
+        self.unavoidable.append(f"Page {page}: a small content stream drawing the original's invisible images "
+                                "was added before the second PDF's own content stream(s), which are unchanged.")
 
     def do_pages(self) -> None:
         for row in self.rows_with("page:"):
@@ -679,6 +857,67 @@ class Job:
         # The outcome is reported after saving, when it is known whether the ID survived.
 
 
+def _content_bytes(page: Any) -> bytes:
+    try:
+        c = page.obj.get("/Contents")
+        streams = list(c) if is_obj(c, Array) else [c] if c is not None else []
+        return b"".join(x.read_bytes() for x in streams if is_obj(x, Stream))
+    except Exception:
+        return b""
+
+
+def _invisible(img: Any) -> bool:
+    """True if drawing ``img`` cannot change the page (fully transparent)."""
+    try:
+        smask = img.get("/SMask")
+        if is_obj(smask, Stream):
+            if "/Decode" in smask or "/Matte" in smask:
+                return False
+            data = smask.read_bytes()
+            return bool(data) and not any(data)
+        mask = img.get("/Mask")
+        if is_obj(mask, Array) and int(img.get("/BitsPerComponent", 8)) == 8:
+            ranges = [int(x) for x in mask]
+            n = len(ranges) // 2
+            data = img.read_bytes()
+            if not data or len(data) % n or len(data) > 1_000_000:
+                return False
+            for i in range(0, len(data), n):
+                for c in range(n):
+                    if not ranges[2 * c] <= data[i + c] <= ranges[2 * c + 1]:
+                        return False
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _fmt(x: float) -> bytes:
+    if abs(x - round(x)) < 1e-9:
+        return b"%d" % round(x)
+    return (b"%.6f" % x).rstrip(b"0").rstrip(b".")
+
+
+def _add_xobject(page: Any, name: str, obj: Any) -> str:
+    """Register ``obj`` in the page's XObject resources; returns the name used."""
+    res = page.get("/Resources")
+    if res is None:
+        res = _inherited(page, "/Resources")
+    if res is None:
+        page.Resources = Dictionary()
+        res = page.Resources
+    xo = res.get("/XObject")
+    if xo is None:
+        res.XObject = Dictionary()
+        xo = res.XObject
+    final, i = name, 1
+    while final in xo and xo[final].objgen != obj.objgen:
+        final = f"{name}_{i}"
+        i += 1
+    xo[final] = obj
+    return final
+
+
 def _inherited(page: Any, key: str) -> Any:
     node, hops = page.get("/Parent"), 0
     while node is not None and hops < 50:
@@ -763,8 +1002,20 @@ def _reproduce_header(original: Path, output: Path, password: str) -> tuple[str 
     return status, message
 
 
+def _reuse_original_encryption(src: Pdf, opts: Options, original_password: str) -> bool:
+    """True when the requested encryption is exactly the original's (no new passwords or permissions)."""
+    if not src.is_encrypted or opts.encryption != "original" or opts.enc_owner:
+        return False
+    if opts.enc_user != original_password or not src.user_password_matched and not src.owner_password_matched:
+        return False
+    info = src.encryption
+    allowed = {p: bool(getattr(src.allow, p)) for p in PERMISSIONS}
+    return int(opts.enc_R) == int(info.R) and {p: bool(v) for p, v in opts.enc_allow.items()} == allowed
+
+
 def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, output: Path, opts: Options,
-                              enc: Any, version: str, second_password: str, notes: list[str]) -> dict | None:
+                              enc: Any, version: str, second_password: str, notes: list[str],
+                              *, second: Path | None = None, original_password: str = "") -> dict | None:
     """Write ``output`` with the original's object numbers; None (with a note) if that fails."""
     tr = job.tr
     pairs: list[tuple[Any, Any]] = [(src.Root, dst.Root), (src.trailer.get("/Info"), dst.trailer.get("/Info")),
@@ -773,6 +1024,7 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
     pairs += [(src.pages[i].obj, dst.pages[i].obj) for i in range(min(len(src.pages), len(dst.pages)))]
     pairs += [(src.get_object(og), d) for og, d in tr.memo.items()]
     pairs += [(src.get_object(og), d) for og, d in tr.remap.items() if is_obj(d, pikepdf.Object)]
+    pairs += job.identity_pairs
     membership = numbering.objstm_membership(src)
     xref_nums = numbering.xref_streams(src)
     src_enc = src.trailer.get("/Encrypt")
@@ -783,8 +1035,24 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
     password = _output_password(opts, second_password)
     setup = None
     write_version = version or dst.pdf_version
+    # Raw bytes of both inputs: verbatim copies, key order and token text come from them.
+    orig_data = original.read_bytes()
+    orig_enc = pdfwriter.encryptor_for(src, "orig") if src.is_encrypted else None
+    src_enc_ref = src_enc.objgen if is_obj(src_enc, pikepdf.Object) and src_enc.is_indirect else None
+    raw_orig = rawobjects.RawFile(orig_data, decrypt=orig_enc.decrypt if orig_enc else None, encrypt_ref=src_enc_ref)
+    raw_second = rawobjects.RawFile(second.read_bytes()) if second is not None else None
+    style = raw_orig.style()
     try:
-        if enc is not False:
+        if enc is not False and _reuse_original_encryption(src, opts, original_password):
+            setup = pdfwriter.reuse_encryption(src, raw_orig)
+            cur_id = dst.trailer.get("/ID")
+            if setup is not None and setup.encryptor.R < 5 and not (
+                    is_obj(cur_id, Array) and len(cur_id) and bytes(cur_id[0]) == setup.id[0]):
+                setup = None  # the key depends on /ID[0], which was changed
+            if setup is not None:
+                notes.append("Encryption: the original's encryption dictionary and key are reused, so the output "
+                             "opens with the original's user and owner passwords.")
+        if enc is not False and setup is None:
             setup = pdfwriter.prepare_encryption(dst, enc, password)
             if setup.encryptor.R >= 5 and write_version < "1.7":
                 notes.append(f"PDF version raised from {write_version} to 1.7: AES-256 encryption requires it.")
@@ -804,8 +1072,10 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
     taken = {n for n, _ in nb.map.values()} | reserve
     extra_k = max(taken | {nb.src_max}) + 1
     for og, (n, g) in nb.map.items():
-        if replicate and nb.kind[og] in ("counterpart", "structural") and n in membership:
-            layout.objstm_of[n] = membership[n]
+        original_object = nb.kind[og] in ("counterpart", "structural")
+        if replicate and original_object:
+            if n in membership:  # otherwise it was a top-level object in the original and stays one
+                layout.objstm_of[n] = membership[n]
         elif (replicate or mode == "generate") and g == 0:
             layout.objstm_of[n] = extra_k
     if layout.encrypt_num in taken - reserve:
@@ -818,12 +1088,21 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
         head = f.read(4096)
     start = head.find(b"%PDF-")
     orig_header = rawfile.header_block(head, start)[0] if start != -1 else b"%PDF-1.7\n"
+    if start != -1:  # blank lines between the header and the first object are part of the layout
+        rest = head[start + len(orig_header):]
+        orig_header += rest[:len(rest) - len(rest.lstrip(b" \t\r\n"))]
     header = (headerfix.desired_block(orig_header, write_version) if opts.header_mode == "match"
               else b"%PDF-" + write_version.encode() + b"\n%\xbf\xf7\xa2\xfe\n")
 
+    sources = pdfwriter.Sources(
+        original=raw_orig if raw_orig.entries else None,
+        second=raw_second if raw_second is not None and raw_second.entries else None,
+        from_original={og for og, kind in nb.kind.items() if kind in ("counterpart", "structural")},
+        original_encrypted=src.is_encrypted, second_encrypted=dst.is_encrypted)
     tmp = output.with_suffix(".numbered.tmp")
     try:
-        written = pdfwriter.write(dst, nb, tmp, header, layout, ident=ident, encryption=setup)
+        written = pdfwriter.write(dst, nb, tmp, header, layout, ident=ident, encryption=setup,
+                                  sources=sources, style=style)
         problem = pdfwriter.verify(dst, nb, tmp, password, written)
     except Exception as e:
         problem = f"{type(e).__name__}: {e}"
@@ -834,6 +1113,16 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
         return None
     tmp.replace(output)
 
+    total = len(written.verbatim) + len(written.restyled) + len(written.fresh)
+    notes.append(f"Objects: {len(written.verbatim)} of {total} are byte-for-byte identical to the original's "
+                 f"object, {len(written.restyled)} are original objects re-written (changed parts only) in the "
+                 f"original's formatting, and {len(written.fresh)} have no original counterpart and were written in "
+                 f"the original's style ({'compact' if style.compact else 'spaced'} delimiters)."
+                 + (f" {len(written.objstm_verbatim)} object stream(s) copied verbatim." if written.objstm_verbatim
+                    else ""))
+    if len(raw_orig.trailers) > 1:
+        job.unavoidable.append(f"The original has {len(raw_orig.trailers)} cross-reference sections (revisions or "
+                               "linearization); the output is written as a single revision.")
     stats = nb.stats()
     notes.append(f"Object numbers: {stats['counterpart']} object(s) kept the original's number, "
                  f"{stats['structural']} took the number of the original object in the same place, "
@@ -892,6 +1181,10 @@ def _write_preserving_numbers(src: Pdf, dst: Pdf, job: Job, original: Path, outp
     reports.append(("structure:objnum:xref", "copied" if orig_x == out_x else "reconstructed",
                     f"Cross-reference data: {out_x}.", orig_x != out_x))
     return {"reports": reports, "id": ident, "header": header, "orig_header": orig_header,
+            "objstm_used": bool(written.objstms),
+            "objects": {"verbatim": len(written.verbatim), "restyled": len(written.restyled),
+                        "fresh": len(written.fresh), "objstm_verbatim": len(written.objstm_verbatim),
+                        "style": "compact" if style.compact else "spaced"},
             "version": write_version, "objstm_mode": "same layout as the original" if replicate else mode,
             "xref": out_x}
 
@@ -951,7 +1244,8 @@ def copy_properties(original: Path, original_password: str, second: Path, second
                 notes.append("Linearization was requested, so qpdf wrote the file and renumbered the objects.")
             else:
                 preserved = _write_preserving_numbers(src, dst, job, original, output, opts, enc, version,
-                                                      second_password, notes)
+                                                      second_password, notes, second=second,
+                                                      original_password=original_password)
         if preserved is None:
             # fix_metadata_version=False: pikepdf would otherwise re-serialize the XMP packet to update
             # pdf:PDFVersion. The packet written is the one the user approved (verified below).
@@ -986,6 +1280,13 @@ def copy_properties(original: Path, original_password: str, second: Path, second
                 job.report(job.by_id[id], "reconstructed", "Not linearized: the original's object numbers were "
                            "kept instead (only qpdf's writer can linearize, and it renumbers objects). Choose "
                            "'let the writer renumber' with linearization to get fast web view.", partial=True)
+            elif id == "structure:object_streams" and preserved is not None and \
+                    job.by_id[id]["o"]["display"].startswith("Yes") != preserved["objstm_used"]:
+                job.report(job.by_id[id], "reconstructed",
+                           "The original's object-stream layout was followed, but "
+                           + ("no object in the output belongs in an object stream (only streams and objects "
+                              "that were top-level in the original remain)." if not preserved["objstm_used"] else
+                              "objects new to the output were grouped into an object stream."), partial=True)
             else:
                 job.report(job.by_id[id], "reconstructed", msg)
 
@@ -1054,6 +1355,11 @@ def copy_properties(original: Path, original_password: str, second: Path, second
     elif header_row is not None:
         job.report(header_row, "regenerated", "The 'writer default' header option was chosen.")
 
-    return {"items": job.items, "notes": notes,
+    unavoidable = ["Cross-reference offsets and startxref are computed for the new file; they cannot equal the "
+                   "original's unless every byte before them is identical."] + job.unavoidable
+    if preserved is None:
+        unavoidable.append("qpdf wrote the file: it renumbers objects and re-serializes them in its own format.")
+    return {"items": job.items, "notes": notes, "unavoidable": unavoidable,
+            "objects": (preserved or {}).get("objects"),
             "save": {k: (str(v) if not isinstance(v, (bool, str)) else v) for k, v in save_kw.items()
                      if k != "encryption"} | {"encryption": opts.encryption}}

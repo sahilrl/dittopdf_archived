@@ -174,7 +174,8 @@ def _scan_content(content: Any, resources: Any, page: int, res: Resources, ctm: 
             if x.get("/Subtype") == Name.Image:
                 f = res.images.setdefault(_key(x), Found(x))
                 w, h = int(x.get("/Width", 0)), int(x.get("/Height", 0))
-                f.placements.append({"page": page, **_placement(cur, w, h, user_unit)})
+                f.placements.append({"page": page, "name": str(operands[0]), "matrix": list(cur),
+                                     "in_form": depth > 0, **_placement(cur, w, h, user_unit)})
             elif x.get("/Subtype") == Name.Form and _key(x) not in stack:
                 m = x.get("/Matrix")
                 fm = tuple(float(v) for v in m) if m is not None and len(m) == 6 else IDENTITY
