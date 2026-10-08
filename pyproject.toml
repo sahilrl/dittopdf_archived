@@ -1,0 +1,28 @@
+[project]
+name = "dittopdf"
+version = "0.1.0"
+description = "Inspect, compare and copy PDF metadata and document properties from one PDF to another"
+readme = "README.md"
+authors = [
+    { name = "Sahil Rohilla", email = "imsahilrl@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=50.0.2",
+    "flask>=3.1.3",
+    "fonttools>=4.66.1",
+    "pikepdf>=10.16.0",
+]
+
+[project.scripts]
+dittopdf = "dittopdf.cli:main"
+dittopdf-web = "dittopdf.web:main"
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

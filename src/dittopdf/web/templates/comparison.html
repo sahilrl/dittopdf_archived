@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value, badge, filters, status_counts with context %}
+{% block title %}Compare{% endblock %}
+{% block content %}
+<h1>3. Compare</h1>
+<p class="lead">Every property of the original, side by side with the second PDF. Properties are matched by their
+  location (page number, annotation position, font name…). Nothing has been changed yet.</p>
+
+<div class="panel">
+  <table class="files">
+    <thead><tr><th></th><th>Filename (outside the PDF)</th><th>Title (inside)</th><th>Pages</th><th>Version</th><th>Size</th><th>Encrypted</th><th>Signed</th></tr></thead>
+    {% for label, s in [('Original', orig.summary), ('Second PDF', second.summary)] %}
+    <tr><th>{{ label }}</th><td>{{ s.filename }}</td><td>{{ s.title or '—' }}</td><td>{{ s.pages }}</td>
+      <td>{{ s.version }}</td><td>{{ s.size|filesize }}</td><td>{{ 'Yes' if s.encrypted else 'No' }}</td>
+      <td>{{ 'Yes' if s.signed else 'No' }}</td></tr>
+    {% endfor %}
+  </table>
+  {% for w in cmp.warnings %}<div class="callout">{{ w }}</div>{% endfor %}
+  <p style="margin:12px 0 0">
+    {% for k in ['same', 'different', 'only_original', 'only_second', 'unable_inspect'] %}
+      {{ badge(k, (cmp.counts.get(k, 0)) ~ ' ' ~ STATUS[k]|lower) }}
+    {% endfor %}
+  </p>
+  <p style="margin:14px 0 0"><a class="btn primary" href="{{ url_for('web.edit') }}">Review & edit before copying →</a></p>
+</div>
+
+<div class="layout">
+  <nav class="toc" aria-label="Sections">
+    {% for sec in tree %}
+      {% set d = sec.counts.get('different', 0) + sec.counts.get('only_original', 0) + sec.counts.get('only_second', 0) %}
+      <a href="#{{ sec.name|anchor }}"><span>{{ sec.name }}</span><span class="cnt" title="differences">{{ d or '' }}</span></a>
+    {% endfor %}
+  </nav>
+  <div>
+    {{ filters() }}
+    {% for sec in tree %}
+    <section class="sec" id="{{ sec.name|anchor }}">
+      <h2>{{ sec.name }} <span class="meta">{{ status_counts(sec.counts) }}</span></h2>
+      {% for g in sec.groups %}
+      {% set d = g.counts.get('different', 0) + g.counts.get('only_original', 0) + g.counts.get('only_second', 0) %}
+      <details class="grp" {% if d %}open{% endif %}>
+        <summary>{{ g.title }} <span class="meta">{{ status_counts(g.counts) }}</span></summary>
+        <table class="props">
+          <colgroup><col class="c-label"><col class="c-val"><col class="c-val"><col class="c-status"><col class="c-cls"></colgroup>
+          <thead><tr><th>Property</th><th>Original</th><th>Second PDF</th><th>Status</th><th>Copy</th></tr></thead>
+          <tbody>
+          {% set ns = namespace(sub='') %}
+          {% for r in g.rows if r.status != 'absent' %}
+            {% if r.sub != ns.sub %}{% set ns.sub = r.sub %}<tr class="subhead"><td colspan="5">{{ r.sub }}</td></tr>{% endif %}
+            <tr data-row class="st-{{ r.status }}" data-status="{{ r.status }}" data-cls="{{ r.cls }}"
+                data-present="{{ 0 if r.status == 'absent' else 1 }}" data-search="{{ (r.label ~ ' ' ~ r.id)|lower }}">
+              <td class="label">{{ r.label }}{% if r.note %}<div class="note">{{ r.note }}</div>{% endif %}
+                {% if r.warn %}<div class="warnline">⚠ {{ r.warn }}</div>{% endif %}</td>
+              <td class="valcell">{{ value(r.o) }}</td>
+              <td class="valcell">{{ value(r.s) }}</td>
+              <td>{{ badge(r.status, STATUS[r.status]) }}</td>
+              <td>{{ badge(r.cls, CLASSES[r.cls]) }}
+                {% if r.copy_status == 'unable_copy' %}<br>{{ badge('unable_copy', 'Unable to copy') }}{% endif %}
+                {% if r.copy_reason %}<div class="copy-reason">{{ r.copy_reason }}</div>{% endif %}</td>
+            </tr>
+          {% endfor %}
+          {% set absent = g.rows|selectattr('status', 'equalto', 'absent')|list %}
+          {% if absent %}
+            <tr data-row data-present="0" data-status="absent" data-cls="readonly"
+                data-search="{{ absent|map(attribute='label')|join(' ')|lower }}">
+              <td colspan="5" class="absent-list"><span class="badge b-absent">Absent in both</span>
+                {{ absent|map(attribute='label')|join(' · ') }}</td></tr>
+          {% endif %}
+          </tbody>
+        </table>
+      </details>
+      {% endfor %}
+    </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value, badge, filters with context %}
+{% block title %}Original inspected{% endblock %}
+{% block content %}
+{% set s = insp.summary %}
+<h1>Original PDF: {{ s.filename }}</h1>
+<p class="lead">Everything detected in the original is listed below. The filename above comes from your upload and is
+  <em>not</em> stored inside the PDF; the PDF's own title is {% if s.title %}“{{ s.title }}”{% else %}not set{% endif %}.</p>
+
+<div class="panel">
+  <div class="summary-grid">
+    <div class="stat"><div class="k">Uploaded filename</div><div class="v">{{ s.filename }}</div></div>
+    <div class="stat"><div class="k">Title (inside the PDF)</div><div class="v">{{ s.title or '—' }}</div></div>
+    <div class="stat"><div class="k">Pages</div><div class="v">{{ s.pages }}</div></div>
+    <div class="stat"><div class="k">PDF version</div><div class="v">{{ s.version }} (header {{ s.header_version or '?' }})</div></div>
+    <div class="stat"><div class="k">File size</div><div class="v">{{ s.size|filesize }}</div></div>
+    <div class="stat"><div class="k">Encrypted</div><div class="v">{{ 'Yes' if s.encrypted else 'No' }}</div></div>
+    <div class="stat"><div class="k">Linearized</div><div class="v">{{ 'Yes' if s.linearized else 'No' }}</div></div>
+    <div class="stat"><div class="k">Digitally signed</div><div class="v">{{ 'Yes' if s.signed else 'No' }}</div></div>
+  </div>
+  {% if s.warnings %}
+  <div class="callout">qpdf reported {{ s.warnings|length }} warning(s) while reading this file (it may be damaged);
+    see Structure → File structure.</div>
+  {% endif %}
+  {% if s.detail_pages < s.pages %}
+  <div class="callout info">Only the first {{ s.detail_pages }} pages are inspected individually.</div>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">2. Upload the second PDF</h2>
+  <p class="lead">Its content is kept; its metadata and properties will be compared with the original's and replaced
+    by them where technically possible.</p>
+  <form method="post" action="{{ url_for('web.upload_second') }}" enctype="multipart/form-data" data-upload>
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="last_modified" value="">
+    <div class="dropzone" data-dropzone>
+      <strong>Drop the second PDF here</strong> or choose a file
+      <input type="file" name="pdf" accept="application/pdf,.pdf" required>
+      <div class="form-row">
+        <label>Password (only if encrypted) <input type="password" name="password" autocomplete="off"></label>
+        <button class="primary" type="submit">Inspect and compare</button>
+      </div>
+    </div>
+  </form>
+  {% if has_second %}<p><a href="{{ url_for('web.compare') }}">Continue with the second PDF you already uploaded →</a></p>{% endif %}
+</div>
+
+<div class="layout">
+  <nav class="toc" aria-label="Sections">
+    {% for sec in tree %}
+      <a href="#{{ sec.name|anchor }}"><span>{{ sec.name }}</span><span class="cnt">{{ sec.present }}</span></a>
+    {% endfor %}
+  </nav>
+  <div>
+    {{ filters(show_diff=false) }}
+    {% for sec in tree %}
+    <section class="sec" id="{{ sec.name|anchor }}">
+      <h2>{{ sec.name }} <span class="meta">{{ sec.present }} present</span></h2>
+      {% for g in sec.groups %}
+      <details class="grp" {% if g.present and loop.index <= 6 %}open{% endif %}>
+        <summary>{{ g.title }} <span class="meta">{{ g.present }} / {{ g.rows|length }} present</span></summary>
+        <table class="props">
+          <colgroup><col class="c-label"><col style="width:58%"><col class="c-cls"></colgroup>
+          <thead><tr><th>Property</th><th>Value</th><th>Copy classification</th></tr></thead>
+          <tbody>
+          {% set ns = namespace(sub='') %}
+          {% for e in g.rows if e.present or e.error %}
+            {% if e.sub != ns.sub %}{% set ns.sub = e.sub %}<tr class="subhead"><td colspan="3">{{ e.sub }}</td></tr>{% endif %}
+            <tr data-row data-present="{{ 1 if e.present or e.error else 0 }}" data-status="{{ 'same' if e.present else 'absent' }}"
+                data-cls="{{ e.cls }}" data-search="{{ (e.label ~ ' ' ~ e.id)|lower }}">
+              <td class="label">{{ e.label }}{% if e.note %}<div class="note">{{ e.note }}</div>{% endif %}
+                {% if e.warn %}<div class="warnline">⚠ {{ e.warn }}</div>{% endif %}</td>
+              <td class="valcell">{{ value(e) }}</td>
+              <td>{{ badge(e.cls, CLASSES[e.cls]) }}</td>
+            </tr>
+          {% endfor %}
+          {% set absent = g.rows|rejectattr('present')|rejectattr('error')|list %}
+          {% if absent %}
+            <tr data-row data-present="0" data-status="absent" data-cls="readonly"
+                data-search="{{ absent|map(attribute='label')|join(' ')|lower }}">
+              <td colspan="3" class="absent-list"><span class="badge b-absent">Not present</span>
+                {{ absent|map(attribute='label')|join(' · ') }}</td></tr>
+          {% endif %}
+          </tbody>
+        </table>
+      </details>
+      {% endfor %}
+    </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

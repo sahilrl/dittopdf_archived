@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value, badge, status_counts with context %}
+{% block title %}Review & edit{% endblock %}
+
+{% macro editor(r, current) -%}
+  {%- set k = r.kind -%}
+  {%- set name = 'v::' ~ r.id -%}
+  {%- if k == 'date' -%}
+    <input type="text" class="mono" name="{{ name }}" value="{{ current }}" data-editor placeholder="D:YYYYMMDDHHmmSSOHH'mm'" style="width:100%">
+    <div class="date-helper">Pick: <input type="datetime-local" step="1" data-date-picker></div>
+  {%- elif k == 'name' and r.choices -%}
+    <select name="{{ name }}" data-editor>
+      {%- for c in r.choices %}<option value="{{ c }}" {% if c == current %}selected{% endif %}>{{ c }}</option>{% endfor -%}
+      {%- if current and current not in r.choices %}<option value="{{ current }}" selected>{{ current }}</option>{% endif -%}
+    </select>
+  {%- elif k in ('name', 'number') -%}
+    <input type="text" class="mono" name="{{ name }}" value="{{ current }}" data-editor style="width:100%">
+  {%- elif k == 'bool' -%}
+    <select name="{{ name }}" data-editor>
+      <option value="true" {% if current == 'true' %}selected{% endif %}>true</option>
+      <option value="false" {% if current != 'true' %}selected{% endif %}>false</option>
+    </select>
+  {%- elif k == 'xml' -%}
+    <textarea name="{{ name }}" rows="16" data-editor data-xml spellcheck="false">{{ current }}</textarea>
+    <div class="xml-status" data-xml-status></div>
+  {%- elif k == 'object' -%}
+    <textarea name="{{ name }}" rows="{{ [[current.count('\n') + 1, 3]|max, 12]|min }}" data-editor data-json spellcheck="false">{{ current }}</textarea>
+    <div><button type="button" class="small" data-json-tree>Tree editor</button>
+      <span class="xml-status" data-json-status></span></div>
+    <div class="json-tree" data-json-tree-view hidden></div>
+  {%- elif k == 'binary' -%}
+    <textarea name="{{ name }}" rows="2" data-editor spellcheck="false" placeholder="hexadecimal bytes">{{ current }}</textarea>
+  {%- elif k == 'xmp-list' -%}
+    <textarea name="{{ name }}" rows="{{ [[current.count('\n') + 1, 2]|max, 8]|min }}" data-editor placeholder="one item per line">{{ current }}</textarea>
+  {%- else -%}
+    <textarea name="{{ name }}" rows="{{ [[current.count('\n') + 1, 1]|max, 6]|min }}" data-editor>{{ current }}</textarea>
+  {%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+<h1>4. Review & edit</h1>
+<p class="lead">Each output value starts as the original's. Change any field individually: editing a value marks it
+  as a <span class="badge b-custom">Manual override</span>; you can also keep the second PDF's value or remove the
+  property. If you change nothing, everything that can be copied is copied from the original exactly as detected.</p>
+
+<form method="post" id="edit-form" data-edit-form>
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+
+{% if opt_errors %}<div class="callout bad">{% for e in opt_errors %}<div>{{ e }}</div>{% endfor %}</div>{% endif %}
+
+<div class="panel">
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <button type="button" class="primary" data-copy-all title="Every property back to its default: copy the original's value wherever it can be copied safely">Copy all original metadata</button>
+    <span class="lead" style="margin:0">Resets every field to its default. Content-bound properties (tags, optional
+      content, thumbnails, signature data) stay with the second PDF unless you opt in per field.</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Output options</h2>
+  <div class="opts-grid">
+    <fieldset class="opt radio-list"><legend>Annotations & forms</legend>
+      {% for v, l in [('keep', 'Keep the second PDF’s annotations; copy comment metadata (author, dates, text…) onto matching annotations'),
+                      ('replace', 'Replace with the original’s annotations and form fields (popups and replies stay linked)'),
+                      ('merge', 'Add the original’s annotations after the second PDF’s')] %}
+        <label><input type="radio" name="opt_annotations" value="{{ v }}" {% if opts.annotations == v %}checked{% endif %}> {{ l }}</label>
+      {% endfor %}
+      <p class="help">Annotations are drawn on the page, so replacing them changes what the second PDF shows.
+        Signature fields are copied unsigned.</p>
+    </fieldset>
+    <fieldset class="opt radio-list"><legend>Structure tree (tags)</legend>
+      <label><input type="radio" name="opt_struct_tree" value="keep" {% if opts.struct_tree == 'keep' %}checked{% endif %}> Keep the second PDF’s tags</label>
+      <label><input type="radio" name="opt_struct_tree" value="copy" {% if opts.struct_tree == 'copy' %}checked{% endif %}> Copy the original’s structure tree</label>
+      <p class="help">Tags point into the page content. Copy them only if both PDFs have the same content
+        (e.g. the second PDF is a re-saved copy); otherwise accessibility data becomes wrong.</p>
+    </fieldset>
+    <fieldset class="opt radio-list"><legend>File identifier (/ID)</legend>
+      <label><input type="radio" name="opt_id_mode" value="exact" {% if opts.id_mode == 'exact' %}checked{% endif %}> Reproduce both elements exactly</label>
+      <label><input type="radio" name="opt_id_mode" value="first" {% if opts.id_mode == 'first' %}checked{% endif %}> Keep the first element, regenerate the second (PDF spec behaviour for a modified file)</label>
+      <p class="help">Exact reproduction is done by a same-length substitution after writing and is verified; it is
+        not possible for encrypted output.</p>
+    </fieldset>
+    <fieldset class="opt"><legend>Metadata consistency</legend>
+      <label class="check"><input type="checkbox" name="opt_propagate_xmp" {% if opts.propagate_xmp %}checked{% endif %}>
+        Write Document Info overrides into the matching XMP properties too</label>
+      <p class="help">e.g. a new Info Author also updates dc:creator, unless you set dc:creator yourself.</p>
+    </fieldset>
+    <fieldset class="opt"><legend>File structure</legend>
+      <label>PDF header version
+        <select name="opt_version">
+          <option value="" {% if not opts.version %}selected{% endif %}>automatic</option>
+          {% for v in ['1.0','1.1','1.2','1.3','1.4','1.5','1.6','1.7','2.0'] %}
+            <option value="{{ v }}" {% if opts.version == v %}selected{% endif %}>{{ v }}{% if v == defaults.version %} (original){% endif %}</option>
+          {% endfor %}
+        </select></label><br>
+      <label class="check"><input type="checkbox" name="opt_linearize" {% if opts.linearize %}checked{% endif %}> Linearize (fast web view){% if defaults.linearize %} — original is linearized{% endif %}</label><br>
+      <label>Object streams
+        <select name="opt_object_streams">
+          {% for v, l in [('match', 'match the original'), ('generate', 'use object streams'), ('disable', 'no object streams'), ('preserve', 'as in the second PDF')] %}
+            <option value="{{ v }}" {% if opts.object_streams == v %}selected{% endif %}>{{ l }}</option>
+          {% endfor %}
+        </select></label><br>
+      <label class="check"><input type="checkbox" name="opt_compress" {% if opts.compress %}checked{% endif %}> Compress the second PDF’s uncompressed streams</label>
+      <p class="help">Offsets, /Size, /Prev and cross-reference data are always regenerated by the writer.</p>
+    </fieldset>
+    <fieldset class="opt radio-list" data-encryption><legend>Encryption</legend>
+      <label><input type="radio" name="opt_encryption" value="none" {% if opts.encryption == 'none' %}checked{% endif %}> Not encrypted{% if not orig.summary.encrypted %} (like the original){% endif %}</label>
+      <label><input type="radio" name="opt_encryption" value="original" {% if opts.encryption == 'original' %}checked{% endif %}> Encrypt with the original’s method and permissions{% if orig.summary.encrypted %} (like the original){% endif %}</label>
+      {% if second.summary.encrypted %}<label><input type="radio" name="opt_encryption" value="second" {% if opts.encryption == 'second' %}checked{% endif %}> Keep the second PDF’s encryption</label>{% endif %}
+      <div data-enc-fields style="margin-top:8px">
+        <label>User password <input type="text" name="opt_enc_user" value="{{ opts.enc_user }}" autocomplete="off"></label>
+        <label>Owner password <input type="text" name="opt_enc_owner" value="{{ opts.enc_owner }}" autocomplete="off" placeholder="random if empty"></label><br>
+        <label>Revision <select name="opt_enc_R">{% for R, l in [(2, 'R2 · RC4 40-bit'), (3, 'R3 · RC4 128-bit'), (4, 'R4 · RC4/AES-128'), (6, 'R6 · AES-256')] %}
+          <option value="{{ R }}" {% if opts.enc_R == R %}selected{% endif %}>{{ l }}</option>{% endfor %}</select></label>
+        <label class="check"><input type="checkbox" name="opt_enc_aes" {% if opts.enc_aes %}checked{% endif %}> AES (R4)</label>
+        <label class="check"><input type="checkbox" name="opt_enc_metadata" {% if opts.enc_metadata %}checked{% endif %}> Encrypt metadata</label>
+        <div>{% for p in PERMISSIONS %}<label class="check"><input type="checkbox" name="opt_perm_{{ p }}" {% if opts.enc_allow.get(p) %}checked{% endif %}> {{ p.replace('_', ' ') }}</label>{% endfor %}</div>
+      </div>
+      <p class="help">Passwords cannot be recovered from a PDF, so the original’s passwords are not known; the user password
+        defaults to the one you used to open the original.</p>
+    </fieldset>
+  </div>
+</div>
+
+<div class="panel">
+  <h3 style="margin-top:0">Add Document Info keys</h3>
+  <p class="lead">Optional: add keys that neither PDF has (text values).</p>
+  <table class="props" data-add-info>
+    <thead><tr><th style="width:30%">Key</th><th>Value</th></tr></thead>
+    <tbody>
+      {% for k, v in (add_info or []) + [['', '']] %}
+      <tr><td><input type="text" class="mono" name="add_info_key" value="{{ k }}" placeholder="/MyKey" style="width:100%"></td>
+          <td><input type="text" name="add_info_value" value="{{ v }}" style="width:100%"></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <button type="button" class="small" data-add-info-row>Add another key</button>
+</div>
+
+<div class="layout">
+  <nav class="toc" aria-label="Sections">
+    {% for sec in tree %}
+      {% set d = sec.counts.get('different', 0) + sec.counts.get('only_original', 0) + sec.counts.get('only_second', 0) %}
+      <a href="#{{ sec.name|anchor }}"><span>{{ sec.name }}</span><span class="cnt">{{ d or '' }}</span></a>
+    {% endfor %}
+  </nav>
+  <div>
+    <div class="toolbar" data-filters>
+      <input type="search" placeholder="Filter properties…" data-filter-text aria-label="Filter properties">
+      <label class="check"><input type="checkbox" data-filter-absent checked> Hide absent everywhere</label>
+      <label class="check"><input type="checkbox" data-filter-diff> Only differences</label>
+      <label class="check"><input type="checkbox" data-filter-readonly checked> Hide non-copyable</label>
+      <label class="check"><input type="checkbox" data-filter-changed> Only my changes</label>
+      <span class="spacer"></span>
+      <span data-override-count class="badge b-custom" hidden></span>
+    </div>
+    {% for sec in tree %}
+    <section class="sec" id="{{ sec.name|anchor }}">
+      <h2>{{ sec.name }} <span class="meta">{{ status_counts(sec.counts) }}</span></h2>
+      {% for g in sec.groups %}
+      {% set d = g.counts.get('different', 0) + g.counts.get('only_original', 0) + g.counts.get('only_second', 0) %}
+      <details class="grp" {% if d or (errors and g.rows|selectattr('id', 'in', errors)|list) %}open{% endif %}>
+        <summary>{{ g.title }} <span class="meta">{{ status_counts(g.counts) }}</span></summary>
+        <table class="props">
+          <colgroup><col class="c-label"><col style="width:20%"><col style="width:20%"><col class="c-out"></colgroup>
+          <thead><tr><th>Property</th><th>Original</th><th>Second PDF</th><th>Output value</th></tr></thead>
+          <tbody>
+          {% set ns = namespace(sub='') %}
+          {% for r in g.rows %}
+            {% if r.sub != ns.sub %}{% set ns.sub = r.sub %}<tr class="subhead"><td colspan="4">{{ r.sub }}</td></tr>{% endif %}
+            {% set sub = submitted.get(r.id) %}
+            {% set act = sub.action if sub and sub.action in r.actions else r.default %}
+            {% set orig_edit = r.o.edit if r.o.present and r.o.edit is not none else '' %}
+            {% set current = sub.value if sub and sub.value is not none else orig_edit %}
+            <tr data-row class="st-{{ r.status }}{% if r.id in errors %} has-error{% endif %}" data-status="{{ r.status }}" data-cls="{{ r.cls }}"
+                data-present="{{ 0 if r.status == 'absent' else 1 }}" data-search="{{ (r.label ~ ' ' ~ r.id)|lower }}"
+                data-fixed="{{ 0 if r.actions else 1 }}">
+              <td class="label">{{ r.label }}{% if r.note %}<div class="note">{{ r.note }}</div>{% endif %}
+                {% if r.warn %}<div class="warnline">⚠ {{ r.warn }}</div>{% endif %}</td>
+              <td class="valcell">{{ value(r.o) }}</td>
+              <td class="valcell">{{ value(r.s) }}</td>
+              <td class="out">
+              {% if r.actions %}
+                <div class="ctrl" data-ctrl data-default="{{ r.default }}" data-kind="{{ r.kind }}"
+                     data-orig="{{ orig_edit }}" data-orig-present="{{ 1 if r.o.present else 0 }}">
+                  <div class="acts">
+                    <select name="a::{{ r.id }}" data-act aria-label="Action for {{ r.label }}">
+                      {% for a in r.actions %}
+                        <option value="{{ a }}" {% if a == act %}selected{% endif %}>{% if a == 'copy' and not r.o.present %}Match original (absent){% else %}{{ ACTIONS[a] }}{% endif %}</option>
+                      {% endfor %}
+                    </select>
+                    <span class="badge" data-state></span>
+                  </div>
+                  {% if r.editable %}<div class="editor">{{ editor(r, current) }}</div>{% endif %}
+                  <div class="fixed" data-keep-text hidden>{% if r.s.present %}Output keeps: {{ r.s.display|truncate(200) }}{% else %}Absent in the second PDF; stays absent.{% endif %}</div>
+                  <div class="fixed" data-remove-text hidden>Will be absent from the output.</div>
+                  {% if r.copy_reason %}<div class="copy-reason">{{ r.copy_reason }}</div>{% endif %}
+                  {% if r.id in errors %}<div class="err-msg">{{ errors[r.id] }}</div>{% endif %}
+                </div>
+              {% else %}
+                {% if r.copy_status == 'readonly' %}{{ badge('readonly', 'Read-only') }} <span class="fixed">not modified</span>
+                {% elif r.copy_status == 'regenerated' %}{{ badge('regenerate', 'Regenerated') }} <span class="fixed">written by the PDF writer</span>
+                {% elif r.copy_status == 'option' %}{{ badge('option', 'Output option') }} <span class="fixed">set by the output options above</span>
+                {% else %}{{ badge('unable_copy', 'Unable to copy') }}{% endif %}
+                {% if r.copy_reason %}<div class="copy-reason">{{ r.copy_reason }}</div>{% endif %}
+              {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+      {% endfor %}
+    </section>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="sticky-submit">
+  <span class="lead" style="margin:0">A new file is generated; neither upload is modified.</span>
+  <button type="submit" class="primary">Generate output PDF</button>
+</div>
+</form>
+{% endblock %}

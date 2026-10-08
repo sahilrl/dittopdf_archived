@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Result{% endblock %}
+
+{% macro item_table(sections, cols) %}
+  {% for section, items in sections %}
+  <table>
+    <thead><tr><th style="width:24%">{{ section }}</th>{% for c, _ in cols %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for it in items %}
+      <tr><td class="mono">{{ it.group }}{% if it.group %} › {% endif %}{{ it.label }}</td>
+        {% for _, key in cols %}<td>{{ it[key]|truncate(300) }}</td>{% endfor %}</tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+{% endmacro %}
+
+{% block content %}
+<h1>5. Result</h1>
+<div class="panel">
+  <p style="margin-top:0"><a class="btn primary" href="{{ url_for('web.download') }}">Download {{ res.output_name }}</a>
+    <a class="btn" href="{{ url_for('web.edit') }}">Back to review & edit</a></p>
+  <table class="files">
+    <thead><tr><th></th><th>Filename</th><th>Pages</th><th>Version</th><th>Size</th><th>SHA-256</th></tr></thead>
+    {% for label, s in res.files %}
+    <tr><th>{{ label }}</th><td>{{ s.filename }}</td><td>{{ s.pages }}</td><td>{{ s.version }}</td><td>{{ s.size|filesize }}</td>
+      <td class="hash">{{ s.sha256 }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if res.byte_identical %}
+    <div class="callout info">The output is byte-for-byte identical to the original.</div>
+  {% else %}
+    <div class="callout info">The output is <strong>not</strong> byte-for-byte identical to the original, and cannot be:
+      it carries the second PDF's content, and the PDF writer regenerates object numbers, offsets and
+      cross-reference data. The comparison below shows which properties match.</div>
+  {% endif %}
+  <div class="callout">Filesystem metadata (creation/modification times, extended attributes, Finder tags,
+    Zone.Identifier, the filename) lives outside the PDF and was not changed by copying. The downloaded file gets new
+    timestamps from your system.</div>
+  {% for n in res.notes %}<div class="callout info">{{ n }}</div>{% endfor %}
+</div>
+
+<h2>Verification: output re-inspected and compared</h2>
+<div class="panel">
+  <table class="files">
+    <thead><tr><th>Section</th>{% for k, title, _ in res.verify %}<th>{{ title }}</th>{% endfor %}</tr></thead>
+    {% for section, c in res.verify_by_section %}
+    <tr><td>{{ section }}</td>{% for k, _, _ in res.verify %}<td>{{ c.get(k, '') }}</td>{% endfor %}</tr>
+    {% endfor %}
+  </table>
+</div>
+<div class="outcome-list">
+  {% for k, title, sections in res.verify %}
+  <details class="o-{{ k }}" {% if k in ('unexpected', 'unreproduced') and res.verify_counts.get(k) %}open{% endif %}>
+    <summary>{{ title }} <span class="n">{{ res.verify_counts.get(k, 0) }}</span></summary>
+    {{ item_table(sections, [('Original', 'original'), ('Second PDF', 'second'), ('Output', 'output'), ('Why', 'reason')]) }}
+  </details>
+  {% endfor %}
+</div>
+
+<h2>Copy report</h2>
+<div class="outcome-list">
+  {% for k, title, sections in res.outcomes %}
+  <details class="o-{{ k }}" {% if k == 'failed' and res.outcome_counts.get(k) %}open{% endif %}>
+    <summary>{{ title }} <span class="n">{{ res.outcome_counts.get(k, 0) }}</span></summary>
+    {% if sections %}{{ item_table(sections, [('Details', 'message')]) }}{% else %}<p style="padding:0 12px" class="lead">None.</p>{% endif %}
+  </details>
+  {% endfor %}
+</div>
+
+<h2>Writer settings</h2>
+<div class="panel"><table class="files">
+  {% for k, v in res.save.items() %}<tr><th style="width:30%">{{ k }}</th><td class="mono">{{ v }}</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

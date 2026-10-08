@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}dittopdf{% endblock %} · dittopdf</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="{{ url_for('web.index') }}">ditto<span>pdf</span></a>
+    {% set steps = [('Original PDF', 'web.index'), ('Second PDF', 'web.original'), ('Compare', 'web.compare'),
+                    ('Review & edit', 'web.edit'), ('Result', 'web.result')] %}
+    <ol class="steps" aria-label="Progress">
+      {% for label, ep in steps %}
+        {% set n = loop.index %}
+        <li class="{{ 'current' if step == n else ('done' if step and n < step else '') }}">
+          {% if step and n < step %}<a href="{{ url_for(ep) }}">{{ n }}. {{ label }}</a>{% else %}{{ n }}. {{ label }}{% endif %}
+        </li>
+      {% endfor %}
+    </ol>
+    {% if session.get('ws') %}
+    <form method="post" action="{{ url_for('web.reset') }}"
+          onsubmit="return confirm('Delete all uploaded and generated files for this session?')">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <button class="small" type="submit">Start over</button>
+    </form>
+    {% endif %}
+  </div>
+</header>
+<main>
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    <div class="flash {{ category }}" role="status">{{ message }}</div>
+  {% endfor %}
+  {% block content %}{% endblock %}
+</main>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

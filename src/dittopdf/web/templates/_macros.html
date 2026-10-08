@@ -1,0 +1,34 @@
+{% macro value(side, empty='absent') -%}
+  {%- if side.error -%}
+    <div class="val"><span class="err">Unable to inspect: {{ side.error }}</span></div>
+  {%- elif not side.present -%}
+    <div class="val"><span class="absent">{{ empty }}</span></div>
+  {%- else -%}
+    <div class="val">{{ side.display }}</div>
+    {%- if side.detail %}
+    <details class="raw"><summary>structure</summary><pre>{{ side.detail }}</pre></details>
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro badge(cls, text, title='') -%}
+  <span class="badge b-{{ cls }}"{% if title %} title="{{ title }}"{% endif %}>{{ text }}</span>
+{%- endmacro %}
+
+{% macro filters(show_diff=true) %}
+<div class="toolbar" data-filters>
+  <input type="search" placeholder="Filter properties…" data-filter-text aria-label="Filter properties">
+  <label class="check"><input type="checkbox" data-filter-absent> Hide absent properties</label>
+  {% if show_diff %}<label class="check"><input type="checkbox" data-filter-diff> Only differences</label>{% endif %}
+  <label class="check"><input type="checkbox" data-filter-readonly> Hide read-only</label>
+  <span class="spacer"></span>
+  <button type="button" class="small" data-expand-all>Expand all</button>
+  <button type="button" class="small" data-collapse-all>Collapse all</button>
+</div>
+{% endmacro %}
+
+{% macro status_counts(counts) -%}
+  {%- for k in ['different', 'only_original', 'only_second', 'unable_inspect'] if counts.get(k) -%}
+    {{ badge(k, counts[k] ~ ' ' ~ STATUS[k]|lower) }}
+  {%- endfor -%}
+{%- endmacro %}

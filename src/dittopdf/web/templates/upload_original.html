@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Upload original{% endblock %}
+{% block content %}
+<h1>1. Upload the original PDF</h1>
+<p class="lead">The original is the source of truth: its metadata and document properties are inspected in full
+  (Info dictionary, XMP, catalog, trailer, pages, annotations, fonts, images, embedded files, signatures, output
+  intents, PDF 2.0 structures and more) and later copied onto your second PDF.</p>
+
+<div class="panel">
+  <form method="post" action="{{ url_for('web.upload_original') }}" enctype="multipart/form-data" data-upload>
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="last_modified" value="">
+    <div class="dropzone" data-dropzone>
+      <strong>Drop the original PDF here</strong> or choose a file
+      <input type="file" name="pdf" accept="application/pdf,.pdf" required>
+      <div class="form-row">
+        <label>Password (only if encrypted) <input type="password" name="password" autocomplete="off"></label>
+        <button class="primary" type="submit">Inspect original</button>
+      </div>
+      <p class="lead" style="margin:12px auto 0">Maximum size {{ max_upload_mb }} MB. Files are stored in an
+        isolated temporary workspace for this session and deleted automatically.</p>
+    </div>
+  </form>
+</div>
+{% if has_original %}
+<p><a href="{{ url_for('web.original') }}">Continue with the original you already uploaded →</a></p>
+{% endif %}
+{% endblock %}
