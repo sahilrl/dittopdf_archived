@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pikepdf
 import pytest
@@ -751,3 +752,77 @@ def test_resource_names_shared_with_unpaired_content_left_alone(tmp_path):
         assert b"/R9 9 Tf" in o.pages[0].obj.Contents.read_bytes()
         assert set(res.ExtGState.keys()) == {"/GS1"} and b"/GS1 gs" in o.pages[0].obj.Contents.read_bytes()
     assert any("Resource names were left" in u and "annotation appearance" in u for u in rep["unavoidable"])
+
+
+# ----------------------------------------------------------------------------- re-encoded images
+
+
+def _logo_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """A logo the second PDF re-encoded (another JPEG of the same picture) and a chart that differs
+    by one bar, same size and position in both files."""
+    import io
+    import zlib
+
+    from PIL import Image, ImageDraw
+
+    logo = Image.new("RGB", (120, 60), (255, 255, 255))
+    ImageDraw.Draw(logo).ellipse((10, 5, 110, 55), fill=(20, 90, 200))
+    chart = Image.new("RGB", (80, 40), (255, 255, 255))
+    ImageDraw.Draw(chart).rectangle((10, 10, 20, 39), fill=(0, 0, 0))
+    chart2 = chart.copy()
+    ImageDraw.Draw(chart2).rectangle((50, 36, 52, 39), fill=(0, 0, 0))  # a short new bar
+
+    def build(path: Path, quality: int, chart_img: Any) -> Path:
+        pdf = Pdf.new()
+        pdf.add_blank_page(page_size=(300, 300))
+        buf = io.BytesIO()
+        logo.save(buf, "JPEG", quality=quality)
+        jpg = pdf.make_stream(buf.getvalue(), Type=Name.XObject, Subtype=Name.Image, Width=120, Height=60,
+                              ColorSpace=Name.DeviceRGB, BitsPerComponent=8, Filter=Name.DCTDecode)
+        ch = pdf.make_stream(b"", Type=Name.XObject, Subtype=Name.Image, Width=80, Height=40,
+                             ColorSpace=Name.DeviceRGB, BitsPerComponent=8)
+        ch.write(zlib.compress(chart_img.tobytes()), filter=Name.FlateDecode)
+        page = pdf.pages[0].obj
+        page.Resources = Dictionary(XObject=Dictionary(Logo=jpg, Chart=ch))
+        page.Contents = pdf.make_stream(b"q 120 0 0 60 10 230 cm /Logo Do Q q 80 0 0 40 10 10 cm /Chart Do Q")
+        pdf.save(path)
+        return path
+
+    return build(tmp_path / "orig.pdf", 80, chart), build(tmp_path / "second.pdf", 95, chart2)
+
+
+def test_reencoded_image_uses_original(tmp_path):
+    from dittopdf.services import imagematch
+
+    orig, second = _logo_pair(tmp_path)
+    with Pdf.open(orig) as a, Pdf.open(second) as b:
+        xa, xb = a.pages[0].obj.Resources.XObject, b.pages[0].obj.Resources.XObject
+        logo = imagematch.compare(imagematch.picture(xa.Logo), imagematch.picture(xb.Logo))
+        chart = imagematch.compare(imagematch.picture(xa.Chart), imagematch.picture(xb.Chart))
+        assert not logo.identical and imagematch.same_picture(logo, "similar")
+        assert not imagematch.same_picture(logo, "identical")
+        assert chart.mean < imagematch.MEAN_LIMIT and not imagematch.same_picture(chart, "similar")
+    out = tmp_path / "out.pdf"
+    rep, _, _ = run(orig, second, out)
+    with Pdf.open(out) as o, Pdf.open(orig) as src, Pdf.open(second) as sec:
+        xo = o.pages[0].obj.Resources.XObject
+        # The logo is stored once. The original's chart is a different picture: it stays an
+        # original-only image (copied, not drawn), as the "Images only the original has" option says.
+        assert set(xo.keys()) == {"/Logo", "/Chart", "/Chart_1"}
+        logos = [x for x in o.objects if isinstance(x, pikepdf.Stream) and x.get("/Filter") == Name.DCTDecode]
+        assert len(logos) == 1
+        assert xo.Logo.objgen == src.pages[0].obj.Resources.XObject.Logo.objgen
+        assert xo.Logo.read_raw_bytes() == src.pages[0].obj.Resources.XObject.Logo.read_raw_bytes()
+        assert xo.Chart.read_bytes() == sec.pages[0].obj.Resources.XObject.Chart.read_bytes()  # differs: kept
+        assert not o.get_warnings() and not o.check_pdf_syntax()
+    assert any(n.startswith("Same pictures:") and "/Logo" in n and "/Chart" not in n for n in rep["notes"])
+
+
+@pytest.mark.parametrize("mode", ["identical", "none"])
+def test_reencoded_image_reuse_stricter_modes(tmp_path, mode):
+    orig, second = _logo_pair(tmp_path)
+    out = tmp_path / "out.pdf"
+    run(orig, second, out, image_reuse=mode)
+    with Pdf.open(out) as o, Pdf.open(second) as sec:
+        assert o.pages[0].obj.Resources.XObject.Logo.read_raw_bytes() == \
+            sec.pages[0].obj.Resources.XObject.Logo.read_raw_bytes()

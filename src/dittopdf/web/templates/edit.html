@@ -81,6 +81,15 @@
       <p class="help">Exact reproduction is done by a same-length substitution after writing and is verified; it is
         not possible for encrypted output.</p>
     </fieldset>
+    <fieldset class="opt radio-list"><legend>Images the second PDF re-encoded</legend>
+      <label><input type="radio" name="opt_image_reuse" value="similar" {% if opts.image_reuse == 'similar' %}checked{% endif %}> Use the original’s image when the picture is the same, even if re-encoded (e.g. another JPEG of the same logo)</label>
+      <label><input type="radio" name="opt_image_reuse" value="identical" {% if opts.image_reuse == 'identical' %}checked{% endif %}> Only when the pixels are exactly the same</label>
+      <label><input type="radio" name="opt_image_reuse" value="none" {% if opts.image_reuse == 'none' %}checked{% endif %}> Keep the second PDF’s images</label>
+      <p class="help">Images of the same size on the same page are decoded and compared. A match replaces the
+        second PDF’s image with the original’s (byte for byte, under its own number), so each picture is stored
+        once instead of the original’s copy sitting unused. “Same” allows re-encoding noise only: a changed
+        digit, barcode bar or chart bar is a different picture.</p>
+    </fieldset>
     <fieldset class="opt radio-list"><legend>Images only the original has</legend>
       <label><input type="radio" name="opt_original_images" value="invisible" {% if opts.original_images == 'invisible' %}checked{% endif %}> Copy them byte for byte under their original numbers; draw the invisible ones (e.g. 1×1 transparent spacers) at their original positions</label>
       <label><input type="radio" name="opt_original_images" value="none" {% if opts.original_images == 'none' %}checked{% endif %}> Don’t copy them</label>

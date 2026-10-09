@@ -24,7 +24,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
 from dittopdf.services import (
-    headerfix, numbering, pdfobj, pdfwriter, rawfile, rawobjects, resnames, resources, xmp,
+    headerfix, imagematch, numbering, pdfobj, pdfwriter, rawfile, rawobjects, resnames, resources, xmp,
 )
 from dittopdf.services.model import (
     COPY, CUSTOM, DIRECT, KEEP, READONLY, RECONSTRUCT, REGENERATE, REMOVE, UNREPRODUCIBLE,
@@ -61,6 +61,7 @@ class Options:
     struct_tree: str = "match"         # match (remove if the original has none) | keep | copy
     original_images: str = "invisible"  # copy original-only images; draw the invisible ones | none
     resource_names: str = "original"   # original (rename resources to the original's names) | keep
+    image_reuse: str = "similar"       # use the original's image for the same picture: similar | identical | none
     id_mode: str = "exact"             # exact | first
     header_mode: str = "match"         # match | writer (header line + binary marker bytes)
     numbering: str = "preserve"        # preserve (original's object numbers) | writer (qpdf renumbers)
@@ -310,6 +311,7 @@ class Job:
         self.do_info()
         self.do_xmp()
         self.do_trailer()
+        self.do_reuse_original_images()
         self.do_resource_names()
         self.do_original_images()
         self.do_identical_streams()
@@ -552,6 +554,75 @@ class Job:
             self.unavoidable.append(f"{unmatched} stream(s) of the second PDF (page content, images, fonts…) have "
                                     "no original stream with identical decoded content, so their bytes are the "
                                     "second PDF's.")
+
+    def do_reuse_original_images(self) -> None:
+        """Use the original's image where the second PDF draws the same picture, encoded differently.
+
+        Without this the output holds the picture twice: the second PDF's copy (drawn) and the
+        original's (copied as an original-only image, never drawn). Images on the same page with
+        the same size are decoded and compared (see :mod:`imagematch`); on a match every
+        reference to the second PDF's image points at the original's, copied byte for byte
+        under its own number, and the second PDF's copy is no longer written.
+        """
+        mode = self.opts.image_reuse
+        if mode not in ("similar", "identical"):
+            return
+        n = min(len(self.src.pages), len(self.dst.pages), self.max_pages)
+        try:
+            src_imgs = [f for f in resources.collect(self.src, n).images.values() if f.names]
+            dst_imgs = [f for f in resources.collect(self.dst, n).images.values() if f.names]
+        except Exception:
+            return
+        src_keys: dict[Any, str] = {}
+        for f in src_imgs:
+            try:
+                src_keys[f.obj.objgen] = pdfobj.canonical(f.obj)
+            except Exception:
+                pass
+        pictures: dict[Any, Any] = {}
+
+        def picture(side: str, o: Any) -> Any:
+            k = (side, o.objgen)
+            if k not in pictures:
+                pictures[k] = imagematch.picture(o)
+            return pictures[k]
+
+        used: set = set()
+        reused: list[str] = []
+        for d in dst_imgs:
+            do = d.obj
+            if not do.is_indirect:
+                continue
+            try:
+                if pdfobj.canonical(do) in src_keys.values():
+                    continue  # the same object: its stream gets the original's bytes later
+            except Exception:
+                continue
+            size = (do.get("/Width"), do.get("/Height"))
+            best = None
+            for s in src_imgs:
+                so = s.obj
+                if so.objgen in used or not so.is_indirect or not (s.pages & d.pages) \
+                        or (so.get("/Width"), so.get("/Height")) != size:
+                    continue
+                m = imagematch.compare(picture("s", so), picture("d", do))
+                if imagematch.same_picture(m, mode) and (best is None or m.mean < best[1].mean):
+                    best = (s, m)
+            if best is None:
+                continue
+            s, m = best
+            copy = self.tr.copy(s.obj)
+            if copy is None:
+                continue
+            used.add(s.obj.objgen)
+            refs = _replace_refs(self.dst, do.objgen, copy)
+            reused.append(f"original image {s.obj.objgen[0]} {s.obj.objgen[1]} ({size[0]}×{size[1]} px) "
+                          f"replaces the second PDF's {', '.join(sorted(d.names))} ({m.describe()}; "
+                          f"{refs} reference(s))")
+        if reused:
+            self.notes.append("Same pictures: the second PDF re-encoded images the original has, so the "
+                              "original's images are used instead (byte for byte, under their own numbers) and "
+                              "each picture is stored once: " + "; ".join(reused) + ".")
 
     def do_resource_names(self) -> None:
         """Give the second PDF's resources the original's names (/F1, /Im0, /GS1…).
@@ -1023,6 +1094,33 @@ def _content_bytes(page: Any) -> bytes:
         return b"".join(x.read_bytes() for x in streams if is_obj(x, Stream))
     except Exception:
         return b""
+
+
+def _replace_refs(pdf: Pdf, old: tuple[int, int], new: Any) -> int:
+    """Point every reference to object ``old`` in ``pdf`` at ``new``; returns how many were changed."""
+    count = 0
+
+    def walk(c: Any) -> None:
+        nonlocal count
+        if is_obj(c, Array):
+            items: Any = list(enumerate(c))
+        else:
+            d = c.stream_dict if is_obj(c, Stream) else c
+            items = list(d.items())
+        for k, v in items:
+            if not is_obj(v, pikepdf.Object):
+                continue
+            if v.is_indirect:
+                if v.objgen == old:
+                    c[k] = new
+                    count += 1
+            elif is_obj(v, (Dictionary, Array)):
+                walk(v)
+
+    for o in numbering.reachable(pdf):
+        if is_obj(o, (Dictionary, Array, Stream)):
+            walk(o)
+    return count
 
 
 def _resources(node: Any) -> tuple[Any, Any]:

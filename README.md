@@ -118,6 +118,17 @@ What this means in practice:
   PDF's streams decodes to exactly the same data as an original stream (same
   image pixels, same page content, same font file), it takes the original's
   encoded bytes, filters and object number. The stored size then matches too.
+- **Re-encoded images.** Another producer often stores the same picture
+  differently: a new JPEG of the same logo, or DeviceRGB instead of CalRGB.
+  Images of the same size on the same page are decoded and compared,
+  including their transparency. When the picture is the same, every reference
+  to the second PDF's image points at the original's image instead. That image
+  is copied byte for byte under its own number, and the picture is stored once.
+  "The same" means a mean difference of at most 4/255 and no 4×4-pixel block
+  differing by more than 32/255. Averaging over blocks removes re-encoding
+  noise but keeps real changes: a changed digit, barcode bar or chart bar fails
+  the test even when the mean barely moves. Colour-keyed images must match
+  exactly. Option: *similar* (default), *identical* pixels only, or *none*.
 - **Images only the original has**, such as JasperReports' 1×1 transparent
   spacer images, are copied byte for byte under their original numbers. Those
   that can't change the page's appearance (fully transparent soft mask or a
@@ -195,6 +206,7 @@ What this means in practice:
 | Annotations & forms | keep the second PDF's (default; comment metadata is copied onto matching annotations, and the form dictionary is removed if the original has none) · replace with the original's · add the original's |
 | Structure tree | match the original (default: removed if the original is untagged, otherwise the second PDF's is kept) · keep the second PDF's · copy the original's (only correct if the content is the same) |
 | Images only the original has | copy them and draw the invisible ones (default) · don't copy them |
+| Re-encoded images | use the original's when the picture is the same (default) · only when the pixels are identical · keep the second PDF's |
 | Resource names | use the original's names (default) · keep the second PDF's |
 | File identifier | reproduce both elements (default) · keep the first, regenerate the second |
 | Metadata consistency | write Info overrides into the matching XMP properties (default on) |
@@ -240,6 +252,7 @@ src/dittopdf/
 │   ├── numbering.py   # output object numbers matching the original's
 │   ├── pdfwriter.py   # writer keeping numbers, bytes and style (object streams, xref, encryption)
 │   ├── resources.py   # font/image discovery, image placement & DPI
+│   ├── imagematch.py  # same picture despite re-encoding (pixel comparison)
 │   ├── resnames.py    # resource names: content-stream scanning, matching, renaming
 │   ├── fonts.py       # embedded font programs (fontTools)
 │   ├── signatures.py  # signature fields and certificates (cryptography)
