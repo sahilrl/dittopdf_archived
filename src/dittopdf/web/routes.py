@@ -373,6 +373,7 @@ def parse_options(form: Any, defaults: Options) -> tuple[Options, list[str]]:
     o.annotations = choice("opt_annotations", {"keep", "replace", "merge"}, o.annotations)
     o.struct_tree = choice("opt_struct_tree", {"match", "keep", "copy"}, o.struct_tree)
     o.original_images = choice("opt_original_images", {"invisible", "none"}, o.original_images)
+    o.resource_names = choice("opt_resource_names", {"original", "keep"}, o.resource_names)
     o.id_mode = choice("opt_id_mode", {"exact", "first"}, o.id_mode)
     o.header_mode = choice("opt_header_mode", {"match", "writer"}, o.header_mode)
     o.numbering = choice("opt_numbering", {"preserve", "writer"}, o.numbering)

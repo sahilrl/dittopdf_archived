@@ -88,6 +88,14 @@
         content streams, which stay unchanged. Visible images are copied into the page resources but not drawn,
         because drawing them would change the page.</p>
     </fieldset>
+    <fieldset class="opt radio-list"><legend>Resource names</legend>
+      <label><input type="radio" name="opt_resource_names" value="original" {% if opts.resource_names == 'original' %}checked{% endif %}> Use the original’s names (<code>/F1</code>, <code>/Im0</code>, <code>/GS1</code>…) for the matching fonts, images, graphics states and other resources</label>
+      <label><input type="radio" name="opt_resource_names" value="keep" {% if opts.resource_names == 'keep' %}checked{% endif %}> Keep the second PDF’s names</label>
+      <p class="help">The resource dictionaries and the content streams that use them are renamed together; only
+        the name operands change, so the page looks the same. Resources are matched as the same object, then the
+        same font or image size, then the same kind in order of use. Resources shared with content that has no
+        counterpart in the original (e.g. annotation appearances) keep their names.</p>
+    </fieldset>
     <fieldset class="opt"><legend>Metadata consistency</legend>
       <label class="check"><input type="checkbox" name="opt_propagate_xmp" {% if opts.propagate_xmp %}checked{% endif %}>
         Write Document Info overrides into the matching XMP properties too</label>

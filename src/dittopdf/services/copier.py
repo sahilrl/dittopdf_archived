@@ -15,6 +15,7 @@ import json
 import re
 import secrets
 import zlib
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,9 @@ from typing import Any
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream, String
 
-from dittopdf.services import headerfix, numbering, pdfobj, pdfwriter, rawfile, rawobjects, resources, xmp
+from dittopdf.services import (
+    headerfix, numbering, pdfobj, pdfwriter, rawfile, rawobjects, resnames, resources, xmp,
+)
 from dittopdf.services.model import (
     COPY, CUSTOM, DIRECT, KEEP, READONLY, RECONSTRUCT, REGENERATE, REMOVE, UNREPRODUCIBLE,
 )
@@ -57,6 +60,7 @@ class Options:
     annotations: str = "keep"          # keep | replace | merge
     struct_tree: str = "match"         # match (remove if the original has none) | keep | copy
     original_images: str = "invisible"  # copy original-only images; draw the invisible ones | none
+    resource_names: str = "original"   # original (rename resources to the original's names) | keep
     id_mode: str = "exact"             # exact | first
     header_mode: str = "match"         # match | writer (header line + binary marker bytes)
     numbering: str = "preserve"        # preserve (original's object numbers) | writer (qpdf renumbers)
@@ -197,6 +201,7 @@ class Job:
         self.max_pages = max_pages
         self.done: set[str] = set()
         self.propagated: set[str] = set()
+        self.canon_cache: dict[tuple[str, tuple[int, int]], str] = {}
 
     # -- reporting -------------------------------------------------------------------------
 
@@ -305,6 +310,7 @@ class Job:
         self.do_info()
         self.do_xmp()
         self.do_trailer()
+        self.do_resource_names()
         self.do_original_images()
         self.do_identical_streams()
         if self.tr.dropped_pages:
@@ -546,6 +552,159 @@ class Job:
             self.unavoidable.append(f"{unmatched} stream(s) of the second PDF (page content, images, fonts…) have "
                                     "no original stream with identical decoded content, so their bytes are the "
                                     "second PDF's.")
+
+    def do_resource_names(self) -> None:
+        """Give the second PDF's resources the original's names (/F1, /Im0, /GS1…).
+
+        A resource dictionary's keys and the operands naming them in every content stream
+        resolved against it are renamed together. Pages are paired by number, form XObjects
+        through their paired names. A dictionary is left alone when renaming it could change what
+        is drawn: it is also used by content that isn't paired (annotation appearances, Type 3
+        glyphs, the form's default resources, pages the original lacks), or one of its content
+        streams is shared with other resources, can't be tokenized reliably or isn't Flate/plain.
+        """
+        if self.opts.resource_names != "original":
+            return
+        dst = self.dst
+        n = min(len(self.src.pages), len(dst.pages), self.max_pages)
+        queue: deque = deque()
+        for i in range(n):
+            sp, dp = self.src.pages[i].obj, dst.pages[i].obj
+            queue.append((f"page {i + 1}", _resources(sp)[0], _contents(sp), dp, *_resources(dp), _contents(dp)))
+        units: list[dict] = []
+        owners: set = set()
+        frozen: dict[Any, str] = {}
+        scans: dict[Any, list | None] = {}
+        while queue:
+            label, s_res, s_streams, owner, d_res, holder, d_streams = queue.popleft()
+            if owner.objgen in owners or not is_obj(d_res, Dictionary):
+                owners.add(owner.objgen)
+                continue
+            owners.add(owner.objgen)
+            streams = d_streams + _forms_without_resources(d_res)
+            for s in streams:
+                if s.objgen not in scans:
+                    scans[s.objgen] = _scan_stream(s)
+            bad = any(scans[s.objgen] is None for s in streams)
+            try:
+                s_order = resnames.first_use(resnames.scan(b"\n".join(s.read_bytes() for s in s_streams)))
+            except Exception:
+                s_order = {}
+            d_order = resnames.first_use(r for s in streams for r in scans[s.objgen] or [])
+            unit = {"label": label, "streams": streams, "cats": {}}
+            for cat in resnames.CATEGORIES:
+                dcat = d_res.get(cat)
+                if not is_obj(dcat, Dictionary):
+                    continue
+                key = _cat_key(d_res, holder, cat)
+                scat = s_res.get(cat) if is_obj(s_res, Dictionary) else None
+                pairs = resnames.pair_names(cat, scat, dcat, s_order.get(cat, []), d_order.get(cat, []),
+                                            self._same_resource)
+                unit["cats"][cat] = (key, dcat, pairs)
+                if bad:
+                    frozen.setdefault(key, "a content stream using them could not be tokenized reliably or is "
+                                           "compressed with a filter other than Flate")
+                if cat == "/XObject":
+                    for dn, sn in pairs.items():
+                        dx, sx = dcat[dn], scat[sn]
+                        if all(is_obj(x, Stream) and x.get("/Subtype") == Name.Form
+                               and is_obj(x.get("/Resources"), Dictionary) for x in (dx, sx)):
+                            queue.append((f"form XObject {dn} ({label})", sx.Resources, [sx], dx, dx.Resources,
+                                          dx, [dx]))
+            units.append(unit)
+
+        # A content stream must resolve each category against a single dictionary.
+        stream_keys: dict[Any, dict[str, set]] = {}
+        for u in units:
+            for s in u["streams"]:
+                for cat, (key, _, _) in u["cats"].items():
+                    stream_keys.setdefault(s.objgen, {}).setdefault(cat, set()).add(key)
+        for cats in stream_keys.values():
+            for keys in cats.values():
+                if len(keys) > 1:
+                    for key in keys:
+                        frozen.setdefault(key, "a content stream is shared with other resources")
+        # Resources also used by content that isn't renamed here.
+        for i in range(n, len(dst.pages)):
+            res, holder = _resources(dst.pages[i].obj)
+            _freeze(frozen, res, holder, "they are shared with pages the original doesn't have")
+        for o in numbering.reachable(dst):
+            d = o.stream_dict if is_obj(o, Stream) else o if is_obj(o, Dictionary) else None
+            if d is not None and "/Resources" in d and o.objgen not in owners and d.get("/Type") != Name.Pages:
+                _freeze(frozen, d.get("/Resources"), o, "they are shared with an annotation appearance, "
+                        "Type 3 font or form XObject that has no counterpart in the original")
+        acro = dst.Root.get("/AcroForm")
+        if is_obj(acro, Dictionary):
+            _freeze(frozen, acro.get("/DR"), acro, "they are the interactive form's default resources")
+
+        occupied: dict[Any, set[str]] = {}
+        for u in units:
+            for s in u["streams"]:
+                for r in scans[s.objgen] or []:
+                    if r.cat in u["cats"]:
+                        key, dcat, _ = u["cats"][r.cat]
+                        if r.name not in dcat:
+                            occupied.setdefault(key, set()).add(r.name)
+        renames: dict[Any, tuple[Any, dict[str, str]]] = {}
+        skipped: list[str] = []
+        done: list[str] = []
+        for u in units:
+            for cat, (key, dcat, pairs) in u["cats"].items():
+                if key in renames:
+                    continue
+                rn = resnames.final_names(dcat.keys(), pairs, occupied.get(key, ()))
+                if key in frozen:
+                    if rn:
+                        skipped.append(f"{u['label']} {cat[1:]} ({frozen[key]})")
+                    rn = {}
+                renames[key] = (dcat, rn)
+                done += [f"{u['label']} {old} → {new}" for old, new in rn.items()]
+        if not done:
+            if skipped:
+                self.unavoidable.append("Resource names were left as the second PDF's for " + "; ".join(skipped)
+                                        + ".")
+            return
+
+        rewritten = 0
+        for og, cats in stream_keys.items():
+            rn_by_cat = {cat: renames[next(iter(keys))][1] for cat, keys in cats.items() if len(keys) == 1}
+            refs = scans.get(og)
+            if not refs or not any(rn_by_cat.get(r.cat, {}).get(r.name) for r in refs):
+                continue
+            s = dst.get_object(og)
+            _write_content(s, resnames.rewrite(s.read_bytes(), refs, rn_by_cat))
+            rewritten += 1
+        for dcat, rn in renames.values():
+            if rn:
+                resnames.rename_keys(dcat, rn)
+        shown = "; ".join(done[:12]) + (f"; … ({len(done) - 12} more)" if len(done) > 12 else "")
+        self.notes.append(f"Resource names: {len(done)} resource(s) of the second PDF were renamed to the "
+                          f"original's names ({shown}). {rewritten} content stream(s) using them were rewritten: "
+                          "only the name operands changed.")
+        if skipped:
+            self.unavoidable.append("Resource names were left as the second PDF's for " + "; ".join(skipped) + ".")
+
+    def _same_resource(self, s: Any, d: Any) -> bool:
+        """True if ``d`` is ``s`` copied into the output, or has identical content."""
+        if s.is_indirect and d.is_indirect:
+            m = self.tr.memo.get(s.objgen)
+            if m is None:
+                m = self.tr.remap.get(s.objgen)
+            if is_obj(m, pikepdf.Object) and m.is_indirect and m.objgen == d.objgen:
+                return True
+        try:
+            a, b = self._canonical(s, "s"), self._canonical(d, "d")
+        except Exception:
+            return False
+        return a == b and not a.startswith("partial:")
+
+    def _canonical(self, o: Any, side: str) -> str:
+        if not o.is_indirect:
+            return pdfobj.canonical(o)
+        k = (side, o.objgen)
+        if k not in self.canon_cache:
+            self.canon_cache[k] = pdfobj.canonical(o)
+        return self.canon_cache[k]
 
     def do_original_images(self) -> None:
         """Copy images that only the original has; draw the invisible ones (spacers) where the original did."""
@@ -864,6 +1023,85 @@ def _content_bytes(page: Any) -> bytes:
         return b"".join(x.read_bytes() for x in streams if is_obj(x, Stream))
     except Exception:
         return b""
+
+
+def _resources(node: Any) -> tuple[Any, Any]:
+    """A page's resource dictionary and the node holding it (the page or an ancestor it inherits from)."""
+    hops = 0
+    while is_obj(node, Dictionary) and hops < 50:
+        if "/Resources" in node:
+            return node.get("/Resources"), node
+        node, hops = node.get("/Parent"), hops + 1
+    return None, None
+
+
+def _contents(page: Any) -> list[Any]:
+    c = page.get("/Contents")
+    return [x for x in (list(c) if is_obj(c, Array) else [c]) if is_obj(x, Stream) and x.is_indirect]
+
+
+def _forms_without_resources(res: Any) -> list[Any]:
+    """Form XObjects without their own /Resources: their content resolves names in ``res``."""
+    xo = res.get("/XObject") if is_obj(res, Dictionary) else None
+    if not is_obj(xo, Dictionary):
+        return []
+    return [x for x in xo.values() if is_obj(x, Stream) and x.is_indirect and x.get("/Subtype") == Name.Form
+            and not is_obj(x.get("/Resources"), Dictionary)]
+
+
+def _cat_key(res: Any, holder: Any, cat: str) -> Any:
+    """Identity of the dictionary ``res[cat]``: where it physically lives."""
+    c = res.get(cat)
+    if is_obj(c, pikepdf.Object) and c.is_indirect:
+        return ("obj", c.objgen)
+    if res.is_indirect:
+        return ("res", res.objgen, cat)
+    return ("holder", holder.objgen if is_obj(holder, pikepdf.Object) else id(holder), cat)
+
+
+def _freeze(frozen: dict[Any, str], res: Any, holder: Any, reason: str) -> None:
+    if not is_obj(res, Dictionary):
+        return
+    for cat in resnames.CATEGORIES:
+        if is_obj(res.get(cat), Dictionary):
+            frozen.setdefault(_cat_key(res, holder, cat), reason)
+
+
+def _rewritable(s: Any) -> bool:
+    filt, parms = s.stream_dict.get("/Filter"), s.stream_dict.get("/DecodeParms")
+    if is_obj(filt, Array):
+        filt = filt[0] if len(filt) == 1 else Name.Unknown
+        if is_obj(parms, Array):
+            parms = parms[0] if len(parms) == 1 else Name.Unknown
+    return (filt is None or filt == Name.FlateDecode) and (parms is None or is_obj(parms, Dictionary) and not len(parms))
+
+
+def _scan_stream(s: Any) -> list | None:
+    """Resource-name references in a content stream; None if they can't be rewritten safely."""
+    try:
+        if not _rewritable(s):
+            return None
+        refs = resnames.scan(s.read_bytes())
+        if [(r.cat, r.name) for r in refs] != resnames.parsed_refs(s):
+            return None
+        return refs
+    except Exception:
+        return None
+
+
+def _write_content(s: Any, data: bytes) -> None:
+    """Replace a content stream's data, compressed the way it was (same filter, same zlib level)."""
+    filt = s.stream_dict.get("/Filter")
+    if filt is None:
+        s.write(data)
+        return
+    level = None
+    try:
+        level = rawobjects.zlib_level(s.read_raw_bytes(), s.read_bytes())
+    except Exception:
+        pass
+    s.write(zlib.compress(data, level if level is not None else 6),
+            filter=Array([Name.FlateDecode]) if is_obj(filt, Array) else Name.FlateDecode)
 
 
 def _invisible(img: Any) -> bool:

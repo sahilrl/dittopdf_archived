@@ -168,7 +168,11 @@ def test_default_copy_matches_original(orig, second, tmp_path):
                {str(k): bytes(v) if isinstance(v, pikepdf.String) else str(v) for k, v in src.docinfo.items()}
         assert o.Root.Metadata.read_bytes() == src.Root.Metadata.read_bytes()
         assert len(o.pages) == len(sec.pages) == 2  # content kept
-        assert o.pages[0].obj.Contents.read_bytes() == sec.pages[0].obj.Contents.read_bytes()
+        # Content kept; its Type1 font takes the name of the original's Type1 font (/F2).
+        assert o.pages[0].obj.Contents.read_bytes() == \
+            sec.pages[0].obj.Contents.read_bytes().replace(b"/F1 12 Tf", b"/F2 12 Tf")
+        assert list(o.pages[0].obj.Resources.Font.keys()) == ["/F2"]
+        assert o.pages[0].obj.Resources.Font.F2.BaseFont == "/Times-Roman"
         assert o.Root.PageLayout == Name.TwoColumnLeft and o.Root.Lang == "en-GB"
         assert bool(o.Root.ViewerPreferences.HideToolbar) is True
         assert [bytes(x) for x in o.trailer.ID] == [bytes(x) for x in src.trailer.ID]
@@ -637,3 +641,113 @@ def test_identical_content_keeps_original_object_stream_bytes(tmp_path):
     assert rep["objects"]["objstm_verbatim"] >= 1 and rep["objects"]["fresh"] == 0
     with Pdf.open(out) as o:
         assert not o.get_warnings() and len(o.pages) == 3
+
+
+# ----------------------------------------------------------------------------- resource names
+
+
+def test_resnames_scan_and_rewrite():
+    from dittopdf.services import resnames
+
+    data = (b"q /GS0 gs BT /F#31 12 Tf (a /F1 Tf \\) ) Tj ET /Span <</F1 1>> BDC /P /MC0 BDC EMC EMC\n"
+            b"/CS0 cs 1 0 0 sc /P0 scn /Sh0 sh BI /W 1 /H 1 /CS /CS0 /BPC 8 ID \xffEI\x00 EI Q % /F1 Tf\n/Im0 Do")
+    refs = resnames.scan(data)
+    assert [(r.cat, r.name) for r in refs] == [
+        ("/ExtGState", "/GS0"), ("/Font", "/F1"), ("/Properties", "/MC0"), ("/ColorSpace", "/CS0"),
+        ("/Pattern", "/P0"), ("/Shading", "/Sh0"), ("/ColorSpace", "/CS0"), ("/XObject", "/Im0")]
+    out = resnames.rewrite(data, refs, {"/Font": {"/F1": "/TT2"}, "/ColorSpace": {"/CS0": "/Cs1"},
+                                        "/XObject": {"/Im0": "/img0"}})
+    assert out == (data.replace(b"/F#31 12", b"/TT2 12").replace(b"/CS0", b"/Cs1")
+                   .replace(b"/Im0 Do", b"/img0 Do"))
+    with Pdf.new() as pdf:
+        assert resnames.parsed_refs(pdf.make_stream(data)) == [(r.cat, r.name) for r in refs]
+
+
+def test_resnames_final_names_avoid_collisions():
+    from dittopdf.services.resnames import final_names
+
+    # /F2 -> /F1 frees nothing for the second PDF's own /F1, which is unmatched: it gets a new name.
+    assert final_names(["/F1", "/F2"], {"/F2": "/F1"}) == {"/F2": "/F1", "/F1": "/F1_1"}
+    assert final_names(["/F1", "/F2"], {"/F1": "/F2", "/F2": "/F1"}) == {"/F1": "/F2", "/F2": "/F1"}
+    # A name the content uses without defining it is never handed out.
+    assert final_names(["/A"], {"/A": "/B"}, occupied={"/B"}) == {}
+
+
+def _named_pair(tmp_path: Path, *, share_with_annotation: bool = False) -> tuple[Path, Path]:
+    """Same two-page document from two producers: different resource names, same objects."""
+    import zlib
+
+    def build(path: Path, names: dict[str, str], flate: bool) -> Path:
+        pdf = Pdf.new()
+        img = pdf.make_stream(b"\x80" * 12, Type=Name.XObject, Subtype=Name.Image, Width=2, Height=2,
+                              ColorSpace=Name.DeviceRGB, BitsPerComponent=8)
+        helv = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+        cour = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Courier))
+        gs = Dictionary(Type=Name.ExtGState, ca=0.5)
+        form = pdf.make_stream(f"BT /{names['helv']} 8 Tf (f) Tj ET".encode(), Type=Name.XObject,
+                               Subtype=Name.Form, BBox=[0, 0, 10, 10],
+                               Resources=Dictionary(Font=Dictionary({"/" + names["helv"]: helv})))
+        fonts = pdf.make_indirect(Dictionary({"/" + names["helv"]: helv, "/" + names["cour"]: cour}))
+        for _ in range(2):
+            pdf.add_blank_page(page_size=(200, 200))
+            page = pdf.pages[-1].obj
+            body = (f"/{names['gs']} gs BT /{names['cour']} 9 Tf (c) Tj /{names['helv']} 9 Tf (h) Tj ET "
+                    f"q 10 0 0 10 50 50 cm /{names['img']} Do Q /{names['form']} Do").encode()
+            content = pdf.make_stream(body)
+            if flate:
+                content.write(zlib.compress(body, 9), filter=Name.FlateDecode)
+            page.Contents = content
+            page.Resources = Dictionary(Font=fonts, ExtGState=Dictionary({"/" + names["gs"]: gs}),
+                                        XObject=Dictionary({"/" + names["img"]: img, "/" + names["form"]: form}))
+        if share_with_annotation:
+            ap = pdf.make_stream(f"BT /{names['helv']} 9 Tf (a) Tj ET".encode(), Type=Name.XObject,
+                                 Subtype=Name.Form, BBox=[0, 0, 10, 10], Resources=Dictionary(Font=fonts))
+            pdf.pages[0].obj.Annots = [pdf.make_indirect(Dictionary(
+                Type=Name.Annot, Subtype=Name.Square, Rect=[0, 0, 10, 10], AP=Dictionary(N=ap)))]
+        pdf.save(path)
+        return path
+
+    orig = build(tmp_path / "orig.pdf", {"helv": "F1", "cour": "F2", "gs": "GS1", "img": "Im1", "form": "Fm1"},
+                 flate=True)
+    second = build(tmp_path / "second.pdf", {"helv": "R7", "cour": "R9", "gs": "G3", "img": "X5", "form": "X6"},
+                   flate=False)
+    return orig, second
+
+
+def test_resource_names_copied_from_original(tmp_path):
+    orig, second = _named_pair(tmp_path)
+    out = tmp_path / "out.pdf"
+    rep, _, _ = run(orig, second, out)
+    with Pdf.open(out) as o, Pdf.open(orig) as src:
+        for i in range(2):
+            res, sres = o.pages[i].obj.Resources, src.pages[i].obj.Resources
+            for cat in ("/Font", "/ExtGState", "/XObject"):
+                assert set(res[cat].keys()) == set(sres[cat].keys()), cat
+            assert res.Font.F1.BaseFont == Name.Helvetica and res.Font.F2.BaseFont == Name.Courier
+            # The content now equals the original's, so the original's stream bytes are used.
+            assert o.pages[i].obj.Contents.read_bytes() == src.pages[i].obj.Contents.read_bytes()
+            assert o.pages[i].obj.Contents.read_raw_bytes() == src.pages[i].obj.Contents.read_raw_bytes()
+        form = o.pages[0].obj.Resources.XObject.Fm1
+        assert list(form.Resources.Font.keys()) == ["/F1"] and form.read_bytes() == b"BT /F1 8 Tf (f) Tj ET"
+        assert not o.get_warnings() and not o.check_pdf_syntax()
+    assert any(n.startswith("Resource names:") and "/R7 → /F1" in n for n in rep["notes"])
+
+
+def test_resource_names_option_keep(tmp_path):
+    orig, second = _named_pair(tmp_path)
+    run(orig, second, tmp_path / "out.pdf", resource_names="keep")
+    with Pdf.open(tmp_path / "out.pdf") as o:
+        assert set(o.pages[0].obj.Resources.Font.keys()) == {"/R7", "/R9"}
+
+
+def test_resource_names_shared_with_unpaired_content_left_alone(tmp_path):
+    orig, second = _named_pair(tmp_path, share_with_annotation=True)
+    out = tmp_path / "out.pdf"
+    rep, _, _ = run(orig, second, out)
+    with Pdf.open(out) as o:
+        res = o.pages[0].obj.Resources
+        # The font dictionary is also used by an annotation appearance: renaming it would break that.
+        assert set(res.Font.keys()) == {"/R7", "/R9"}
+        assert b"/R9 9 Tf" in o.pages[0].obj.Contents.read_bytes()
+        assert set(res.ExtGState.keys()) == {"/GS1"} and b"/GS1 gs" in o.pages[0].obj.Contents.read_bytes()
+    assert any("Resource names were left" in u and "annotation appearance" in u for u in rep["unavoidable"])

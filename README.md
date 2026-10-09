@@ -125,6 +125,24 @@ What this means in practice:
   by a small content stream placed before the second PDF's own content
   streams, which stay unchanged. Visible ones are copied into the page
   resources but not drawn, because that would change the page.
+- **Resource names.** Content streams refer to fonts, images, graphics states,
+  colour spaces, patterns, shadings and marked-content properties by the name
+  they have in the page's resource dictionary (`/F1 12 Tf`, `/Im0 Do`). Those
+  names are copied from the original: each of the second PDF's resources is
+  matched to an original resource on the same page (the same object, then the
+  same font ignoring the subset prefix or an image of the same size, then the
+  same kind in order of first use) and takes its name. The dictionary keys and
+  the name operands in every content stream using them are renamed together;
+  every other byte of the content is unchanged, and the stream is recompressed
+  at the zlib level it had. Form XObjects paired this way get the same
+  treatment for their own resources. When the renamed content equals the
+  original's, the original's stream bytes and number are used (see
+  *Compression*). Names are left alone where renaming could change the page:
+  resource dictionaries also used by content without a counterpart
+  (annotation appearances, Type 3 glyphs, the form's `/DR`, extra pages), a
+  content stream shared between different resources, one that can't be
+  tokenized reliably (checked against qpdf's parser) or one compressed with
+  filters other than Flate. The report lists them.
 - **Matching the original's catalog.** If the original has no structure tree,
   the second PDF's tags and their references are removed. The marked-content
   operators inside its page content remain, and the report says so. Catalog
@@ -177,6 +195,7 @@ What this means in practice:
 | Annotations & forms | keep the second PDF's (default; comment metadata is copied onto matching annotations, and the form dictionary is removed if the original has none) · replace with the original's · add the original's |
 | Structure tree | match the original (default: removed if the original is untagged, otherwise the second PDF's is kept) · keep the second PDF's · copy the original's (only correct if the content is the same) |
 | Images only the original has | copy them and draw the invisible ones (default) · don't copy them |
+| Resource names | use the original's names (default) · keep the second PDF's |
 | File identifier | reproduce both elements (default) · keep the first, regenerate the second |
 | Metadata consistency | write Info overrides into the matching XMP properties (default on) |
 | File structure | object numbers (keep the original's · let the writer renumber), header version (defaults to the original's), header bytes (match the original · writer default), linearization (needs the writer to renumber), object streams (defaults to match the original), compress uncompressed streams |
@@ -221,6 +240,7 @@ src/dittopdf/
 │   ├── numbering.py   # output object numbers matching the original's
 │   ├── pdfwriter.py   # writer keeping numbers, bytes and style (object streams, xref, encryption)
 │   ├── resources.py   # font/image discovery, image placement & DPI
+│   ├── resnames.py    # resource names: content-stream scanning, matching, renaming
 │   ├── fonts.py       # embedded font programs (fontTools)
 │   ├── signatures.py  # signature fields and certificates (cryptography)
 │   ├── model.py       # entry model and copy classifications
